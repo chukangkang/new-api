@@ -104,9 +104,18 @@ func VideoProxy(c *gin.Context) {
 			videoProxyError(c, http.StatusBadGateway, "server_error", "Failed to resolve Vertex video URL")
 			return
 		}
-	case constant.ChannelTypeOpenAI, constant.ChannelTypeSora:
+	case constant.ChannelTypeOpenAI:
 		videoURL = fmt.Sprintf("%s/v1/videos/%s/content", baseURL, task.GetUpstreamTaskID())
 		req.Header.Set("Authorization", "Bearer "+channel.Key)
+	case constant.ChannelTypeSora:
+		// Sora: Use upstream API returned video URL if available, otherwise construct proxy URL
+		upstreamVideoURL := task.GetResultURL()
+		if upstreamVideoURL != "" && !strings.HasPrefix(upstreamVideoURL, "data:") {
+			videoURL = upstreamVideoURL
+		} else {
+			videoURL = fmt.Sprintf("%s/v1/videos/%s/content", baseURL, task.GetUpstreamTaskID())
+			req.Header.Set("Authorization", "Bearer "+channel.Key)
+		}
 	default:
 		// Video URL is stored in PrivateData.ResultURL (fallback to FailReason for old data)
 		videoURL = task.GetResultURL()

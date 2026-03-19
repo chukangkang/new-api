@@ -48,6 +48,9 @@ type responseTask struct {
 	CreatedAt          int64  `json:"created_at"`
 	CompletedAt        int64  `json:"completed_at,omitempty"`
 	ExpiresAt          int64  `json:"expires_at,omitempty"`
+	Output            *struct {
+		VideoURL string `json:"video_url"`
+	} `json:"output,omitempty"`
 	Seconds            string `json:"seconds,omitempty"`
 	Size               string `json:"size,omitempty"`
 	RemixedFromVideoID string `json:"remixed_from_video_id,omitempty"`
@@ -304,7 +307,10 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusInProgress
 	case "completed":
 		taskResult.Status = model.TaskStatusSuccess
-		// Url intentionally left empty — the caller constructs the proxy URL using the public task ID
+		// Use upstream API returned video URL if available
+		if resTask.Output != nil && resTask.Output.VideoURL != "" {
+			taskResult.Url = resTask.Output.VideoURL
+		}
 	case "failed", "cancelled":
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
@@ -322,10 +328,29 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
-	data := task.Data
-	var err error
-	if data, err = sjson.SetBytes(data, "id", task.TaskID); err != nil {
-		return nil, errors.Wrap(err, "set id failed")
+	var resTask responseTask
+	if err := common.Unmarshal(task.Data, &resTask); err != nil {
+		return nil, errors.Wrap(err, "unmarshal sora task data failed")
 	}
-	return data, nil
+
+	openAIVideo := dto.NewOpenAIVideo()
+	openAIVideo.ID = task.TaskID
+	openAIVideo.TaskID = task.TaskID
+	openAIVideo.Status = task.Status.ToVideoStatus()
+	openAIVideo.SetProgressStr(task.Progress)
+	if resTask.Output != nil && resTask.Output.VideoURL != "" {
+		openAIVideo.SetMetadata("url", resTask.Output.VideoURL)
+	}
+	openAIVideo.CreatedAt = task.CreatedAt
+	openAIVideo.CompletedAt = task.UpdatedAt
+	openAIVideo.Model = task.Properties.OriginModelName
+
+	if resTask.Status == "failed" || resTask.Status == "cancelled" {
+		openAIVideo.Error = &dto.OpenAIVideoError{
+			Message: "task failed",
+			Code:    "failed",
+		}
+	}
+
+	return common.Marshal(openAIVideo)
 }
