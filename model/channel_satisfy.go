@@ -69,3 +69,29 @@ func isChannelIDInList(list []int, channelID int) bool {
 	}
 	return false
 }
+
+// GroupHasModelAbility 判断分组内是否存在配置了该模型的渠道（持久性配置，
+// 不看渠道启停状态）。用于区分"模型未配置"(404) 与"渠道暂不可用"(503)。
+// 直接查 Ability 表而非启用渠道缓存：渠道被禁用时 Ability 行仍在
+// （仅删除渠道才删行），此时应报 503 而非 404。
+// 仅在渠道选择失败的路径上调用，频率低，DB 查询开销可接受。
+// 匹配口径与渠道选择一致：精确模型名 + FormatMatchingModelName 归一化名。
+func GroupHasModelAbility(group string, modelName string) bool {
+	if group == "" || modelName == "" {
+		return false
+	}
+	return groupHasModelAbilityDB(group, modelName)
+}
+
+func groupHasModelAbilityDB(group string, modelName string) bool {
+	names := []string{modelName}
+	if normalized := ratio_setting.FormatMatchingModelName(modelName); normalized != "" && normalized != modelName {
+		names = append(names, normalized)
+	}
+	var count int64
+	err := DB.Model(&Ability{}).
+		Where(commonGroupCol+" = ? and model IN ? and enabled = ?", group, names, true).
+		Limit(1).
+		Count(&count).Error
+	return err == nil && count > 0
+}

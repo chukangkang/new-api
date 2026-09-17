@@ -155,6 +155,14 @@ func Distribute() func(c *gin.Context) {
 						return
 					}
 					if channel == nil {
+						// Anthropic 对齐：/v1/messages 路径下，若所选分组内根本
+						// 没有任何渠道配置了该模型（持久性配置缺失），返回官方
+						// 404 not_found_error；有能力行但渠道暂时不可用时保持 503。
+						// auto 分组展开后无法确定单一分组，保持 503 不误判。
+						if isAnthropicMessagesPath(c.Request.URL.Path) && usingGroup != "auto" && !model.GroupHasModelAbility(usingGroup, modelRequest.Model) {
+							abortWithAnthropicNotFoundMessage(c, fmt.Sprintf("Model %q is not available for this group", modelRequest.Model))
+							return
+						}
 						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
 						return
 					}
@@ -168,6 +176,12 @@ func Distribute() func(c *gin.Context) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+// isAnthropicMessagesPath 判断请求是否落在 Anthropic /v1/messages 入口
+// （含 /v1/messages/count_tokens）。仅这些路径的"模型不可用"错误
+// 使用官方 not_found_error 报文；其他入口保持既有 OpenAI 风格。
+func isAnthropicMessagesPath(path string) bool {
+	return path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/")
 }
 
 // channelSupportsRequestPath reports whether a channel can serve the request path.

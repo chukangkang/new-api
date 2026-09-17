@@ -33,6 +33,46 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// writeClaudeRelayError 以官方 Anthropic 错误报文格式写出 /v1/messages 的
+// 错误响应（对齐 sub2api anthropic-api-style-v0.2.4 的 errorResponse）：
+//
+//	{
+//	  "type": "error",
+//	  "error": { "type": "...", "message": "...", "code": "..." },
+//	  "request_id": "req_<内部requestID>"
+//	}
+//
+// body 顶层 request_id 与响应头 request-id 同源同值（官方两者同源）。
+// 413（请求体超限）的 error.type 使用官方类型 request_too_large。
+func writeClaudeRelayError(c *gin.Context, newAPIError *types.NewAPIError, requestId string) {
+	claudeError := newAPIError.ToClaudeError()
+	errorType := claudeError.Type
+	message := claudeError.Message
+	// Anthropic 官方校验错误：直接使用官方逐字文案（剥离哨兵前缀），
+	// 且不经过敏感信息掩码，保证与官方 API 逐字一致。
+	if helper.IsAnthropicValidationError(newAPIError) {
+		errorType = "invalid_request_error"
+		message = helper.AnthropicValidationErrorMessage(newAPIError)
+	}
+	// 413（请求体超限）的 error.type 使用官方类型 request_too_large
+	if newAPIError.StatusCode == http.StatusRequestEntityTooLarge {
+		errorType = "request_too_large"
+	}
+	payload := gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    errorType,
+			"message": message,
+		},
+	}
+	if strings.TrimSpace(requestId) != "" {
+		officialID := "req_" + requestId
+		payload["request_id"] = officialID
+		c.Header("request-id", officialID)
+	}
+	c.JSON(newAPIError.StatusCode, payload)
+}
+
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
 	switch info.RelayMode {
@@ -92,15 +132,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
-			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			// Anthropic 官方校验错误的消息已是官方逐字文案，request id 通过
+			// 响应体顶层 request_id 字段与 request-id 响应头传达，不再追加
+			// "(request id: xxx)" 后缀，避免破坏逐字一致性。
+			if !helper.IsAnthropicValidationError(newAPIError) {
+				newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
 			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"type":  "error",
-					"error": newAPIError.ToClaudeError(),
-				})
+				writeClaudeRelayError(c, newAPIError, requestId)
 			default:
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"error": newAPIError.ToOpenAIError(),
@@ -108,6 +150,24 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 		}
 	}()
+
+	// Anthropic 官方 API 参数校验（对齐官方校验规则与错误消息，
+	// 详见 relay/helper/anthropic_messages_validation.go）。
+	// 必须在 GetAndValidateRequest 之前执行：官方逐字文案（如
+	// "field model is required"、"max_tokens is invalid"）优先级高于
+	// 通用校验的同类提示。仅作用于 /v1/messages 入口；
+	// 非 Claude 家族模型保持既有透传行为。
+	if relayFormat == types.RelayFormatClaude {
+		if verr := helper.ValidateClaudeMessagesRequest(c); verr != nil {
+			// 请求体超限同样映射为 413，与通用路径保持一致
+			if common.IsRequestBodyTooLargeError(verr) || errors.Is(verr, common.ErrRequestBodyTooLarge) {
+				newAPIError = types.NewErrorWithStatusCode(verr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
+			} else {
+				newAPIError = types.NewError(verr, types.ErrorCodeInvalidRequest, types.ErrOptionWithStatusCode(http.StatusBadRequest), types.ErrOptionWithSkipRetry())
+			}
+			return
+		}
+	}
 
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
 	if err != nil {
