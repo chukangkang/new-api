@@ -30,8 +30,9 @@
 | `38dad16dc` | 09-17 | max_tokens 超限文案改为官方 pydantic 风格逐字一致（见 R36） |
 | `3a1038097` | 09-17 | 404 模型不可用的线上错误类型统一为官方 `not_found_error`（见 §2.7） |
 | `296f3b3cb` | 09-17 | max_tokens 上限表扩至官方全部有公开规格的模型（见 R36）；新增 13 模型 × 双向断言回归 |
+| `4db39d2c5` | 09-18 | R10 位置敏感：`messages[0].role=system` → 400，中间位置 → 200（对齐真实 API）；count_tokens 渠道路径归一（`/v1/messages/count_tokens` 匹配时剥离后缀，复用 Claude Messages 渠道） |
 
-合计：20 文件，+1758 / -31。
+合计（`git diff v1.0.0-rc.24..HEAD`，截至 `4db39d2c5`）：16 文件，+2654 / -15。
 
 **生产验证（2026-09-17，windf 节点部署 `296f3b3cb` 后实测）**：
 `claude-fable-5-1` + `max_tokens=128001` → 400 官方文案；`=131073` → 400；`=128000` → 200 正常出流。全部符合预期。
@@ -56,7 +57,7 @@
 | R7 | `messages` 空数组 | `"messages" must be a non-empty array` |
 | R8 | `messages[i].role` 缺失 | `"messages[i].role" is a required property` |
 | R9 | `messages[i].role` 非字符串 | `"messages[i].role" must be a string` |
-| R10 | `messages[i].role` ∉ {user, assistant, system}（真实 API 接受 role=system，2026-09-18 真伪验证实测 200） | `"messages[i].role" must be one of: "user", "assistant"` |
+| R10 | `messages[i].role` ∉ {user, assistant, system}；**位置敏感**：`messages[0].role=system` → 400，`messages[i>0].role=system` → 200（真实 API 行为，2026-09-18 真伪验证实测） | `"messages[i].role" must be one of: "user", "assistant"` |
 | R11 | `messages[i].content` 缺失 | `"messages[i].content" is a required property` |
 
 ### 2.2 采样参数（分家族）
@@ -322,6 +323,7 @@ thinkingSignatureMinDecodedLen = 32
 3. **prefill 判定**：只有"最后一条 assistant 消息含**文本**"才算 prefill；只含 tool_use 等结构化块的不算，放行给上游。
 4. **未知模型一律放行**（thinking.type、max_tokens 上限、fast mode 之外的未知项），宁可漏拦不可误杀。
 5. **count_tokens 豁免**：max_tokens 必填、budget<max 比较、签名校验三项都不适用。
-6. **beta 头解析**：`anthropic-beta` 是逗号分隔列表，逐项 trim 后精确匹配。
-7. **签名校验与既有整流链路不冲突**：空/缺签名不归它管（预过滤 + 400 后整流专管），它只管"非空但格式坏"。
-8. 探针脚本里目前硬编码了一个 sk- key，对外分享前先挪回环境变量。
+6. **count_tokens 渠道路径归一**（4db39d2c5）：type-58 高级自定义渠道按入站路径精确相等匹配（`matchAdvancedCustomIncomingPath`），`/v1/messages/count_tokens` 无法匹配配置为 `/v1/messages` 的渠道 → 无满足渠道 → 404。修法：`middleware/distributor.go` 在渠道路径匹配前将 `/count_tokens` 后缀剥离（`channelMatchPath`），使 count_tokens 复用同一 Claude Messages 渠道；上游转发仍走完整路径（`relay/channel/claude/adaptor.go` 的 `GetRequestURL` 检测后缀追加）。
+7. **beta 头解析**：`anthropic-beta` 是逗号分隔列表，逐项 trim 后精确匹配。
+8. **签名校验与既有整流链路不冲突**：空/缺签名不归它管（预过滤 + 400 后整流专管），它只管"非空但格式坏"。
+9. 探针脚本里目前硬编码了一个 sk- key，对外分享前先挪回环境变量。
