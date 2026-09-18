@@ -172,9 +172,14 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		if role.Type != gjson.String {
 			return fmt.Errorf("\"messages[%d].role\" must be a string", i)
 		}
-		// 真实 API 对 messages 中的 role=system 返回 200（真伪验证实测），
-		// 故在 user/assistant 之外额外放行 system；其余角色仍 400。
+		// 真实 API 的位置敏感规则（真伪验证实测）：
+		//   - messages[0] 的 role=system 属非法位置 → 400（midconv_system_leading）
+		//   - 后续位置的 role=system 接受 → 200（midconv_system）
+		//   - 其余角色（非 user/assistant/system）→ 400
 		if role.Str != "user" && role.Str != "assistant" && role.Str != "system" {
+			return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
+		}
+		if i == 0 && role.Str == "system" {
 			return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
 		}
 		if !m.Get("content").Exists() {

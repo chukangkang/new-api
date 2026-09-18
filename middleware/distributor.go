@@ -84,6 +84,13 @@ func Distribute() func(c *gin.Context) {
 				}
 				var selectGroup string
 				usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
+				// Channel path matching normalizes /v1/messages/count_tokens to /v1/messages so
+				// channels configured for the Claude Messages endpoint satisfy the count_tokens
+				// request. Upstream forwarding keeps the full path (handled by the Claude adaptor).
+				channelMatchPath := c.Request.URL.Path
+				if strings.HasSuffix(channelMatchPath, "/count_tokens") {
+					channelMatchPath = strings.TrimSuffix(channelMatchPath, "/count_tokens")
+				}
 				// check path is /pg/chat/completions
 				if strings.HasPrefix(c.Request.URL.Path, "/pg/chat/completions") {
 					playgroundRequest := &dto.PlayGroundRequest{}
@@ -106,7 +113,7 @@ func Distribute() func(c *gin.Context) {
 					affinityUsable := false
 					preferred, err := model.CacheGetChannel(preferredChannelID)
 					if err == nil && preferred != nil && preferred.Status == common.ChannelStatusEnabled &&
-						channelSupportsRequestPath(preferred, c.Request.URL.Path, modelRequest.Model) {
+						channelSupportsRequestPath(preferred, channelMatchPath, modelRequest.Model) {
 						if usingGroup == "auto" {
 							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 							autoGroups := service.GetRequestAutoGroups(c, userGroup)
@@ -137,7 +144,7 @@ func Distribute() func(c *gin.Context) {
 						Ctx:         c,
 						ModelName:   modelRequest.Model,
 						TokenGroup:  usingGroup,
-						RequestPath: c.Request.URL.Path,
+						RequestPath: channelMatchPath,
 						Retry:       common.GetPointer(0),
 					})
 					if err != nil {

@@ -146,9 +146,21 @@ func TestValidateAnthropicRequest_MessageRoleInvalid(t *testing.T) {
 	require.Contains(t, err.Error(), `"messages[0].role" must be one of: "user", "assistant"`)
 }
 
-func TestValidateAnthropicRequest_MessageRoleSystemAccepted(t *testing.T) {
-	// 真伪验证实测：真实 API 对 messages 中的 role=system 返回 200。
+func TestValidateAnthropicRequest_MessageRoleSystemLeadingRejected(t *testing.T) {
+	// 真伪验证实测（midconv_system_leading）：messages[0] 的 role=system 属非法位置 → 400。
 	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "system", "content": "hi"}]}`
+	err := ValidateAnthropicRequest([]byte(body), true, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `"messages[0].role" must be one of: "user", "assistant"`)
+}
+
+func TestValidateAnthropicRequest_MessageRoleSystemMidConversationAccepted(t *testing.T) {
+	// 真伪验证实测（midconv_system）：后续位置的 role=system 接受 → 200。
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [
+		{"role": "user", "content": "hi"},
+		{"role": "system", "content": "note"},
+		{"role": "user", "content": "more"}
+	]}`
 	require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
 }
 
