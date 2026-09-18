@@ -57,8 +57,10 @@ func AnthropicValidationErrorMessage(err error) string {
 
 // ValidateClaudeMessagesRequest 是 /v1/messages 入口的统一校验钩子
 // （原生 Anthropic 组与 OpenAI 桥接组共用同一入口，此处一次挂载两条路径）。
-// 仅当请求模型属于 Claude 家族时执行官方校验；其他模型（grok / deepseek /
-// qwen 等）保持既有透传行为，避免误伤。
+// 对 /v1/messages 入口的所有请求执行官方校验（规范 §4：两条入口无条件挂载）。
+// 基础字段校验（model/max_tokens/messages/role）与采样参数校验对所有模型生效；
+// 模型感知类规则（thinking.type 矩阵、max_tokens 上限、fast mode）在校验器内部
+// 对未知家族 fail-open（规范 §7.4），因此非 Claude 家族模型不会被误杀。
 // 返回 nil 表示校验通过。
 func ValidateClaudeMessagesRequest(c *gin.Context) error {
 	storage, err := common.GetRequestBody(c)
@@ -78,9 +80,6 @@ func ValidateClaudeMessagesRequest(c *gin.Context) error {
 	}
 	if _, seekErr := storage.Seek(0, io.SeekStart); seekErr != nil {
 		return seekErr
-	}
-	if !isClaudeFamilyModel(gjson.GetBytes(body, "model").Str) {
-		return nil
 	}
 	if verr := ValidateAnthropicRequest(body, true, c.GetHeader("anthropic-beta")); verr != nil {
 		return WrapAnthropicValidationError(verr)

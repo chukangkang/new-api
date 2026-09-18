@@ -927,3 +927,18 @@ func TestIsClaudeFamilyModel(t *testing.T) {
 		require.False(t, isClaudeFamilyModel(m), "model %s should not be claude family", m)
 	}
 }
+
+// ── 非 Claude 家族模型也必须经过基础校验（规范 §4 无条件挂载）──
+
+func TestValidateAnthropicRequest_NonClaudeFamilyStillValidated(t *testing.T) {
+	// 合成模型名（e2e 场景）：缺少 max_tokens 必须报 R2 必填错误，
+	// 而不是因为非 claude 前缀被整体跳过。
+	body := `{"model": "model-TZFSPXZ3", "messages": [{"role": "user", "content": "hi"}]}`
+	err := ValidateAnthropicRequest([]byte(body), true, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `"max_tokens" is a required property`)
+
+	// 补齐 max_tokens 后应通过（模型感知类规则对未知家族 fail-open）。
+	okBody := `{"model": "model-TZFSPXZ3", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}`
+	require.NoError(t, ValidateAnthropicRequest([]byte(okBody), true, ""))
+}
