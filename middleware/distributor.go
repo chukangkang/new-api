@@ -160,7 +160,10 @@ func Distribute() func(c *gin.Context) {
 						// 能力行（持久性配置缺失），返回官方 404 not_found_error；
 						// 有能力行但渠道暂时不可用时保持 503。
 						if isAnthropicMessagesPath(c.Request.URL.Path) && anthropicGroupLacksModel(c, usingGroup, modelRequest.Model) {
-							abortWithAnthropicNotFoundMessage(c, fmt.Sprintf("Model %q is not available for this group", modelRequest.Model))
+							// 官方对不存在模型的 404 逐字文案：
+							//   {"type":"error","error":{"type":"not_found_error",
+							//    "message":"No model found with id: <model>"}}
+							abortWithAnthropicNotFoundMessage(c, fmt.Sprintf("No model found with id: %s", modelRequest.Model))
 							return
 						}
 						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)

@@ -218,7 +218,7 @@
 
 | 场景 | 触发点 | 报文 |
 |------|--------|------|
-| 模型不在组白名单 | `GroupModelAllowlist` 中间件（`/messages` 路径走 `AnthropicErrorWriter`） | 404 `not_found_error`，`Model %q is not available for this group` |
+| 模型不在组白名单 | `GroupModelAllowlist` 中间件（`/messages` 路径走 `AnthropicErrorWriter`） | 404 `not_found_error`，`No model found with id: <model>`（官方逐字文案，2026-09-18 对齐；参考实现早期的 `Model %q is not available for this group` 已废弃） |
 | 池内有账号但都不支持该模型（伪造快照） | `classifyNoAccountError`（`no_account_error.go`，单点分类器，所有入口透传） | 404 `not_found_error`，`Model %q is not supported by any configured account in this group` |
 
 移植要点：
