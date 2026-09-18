@@ -221,6 +221,8 @@
 | 模型不在组白名单 | `GroupModelAllowlist` 中间件（`/messages` 路径走 `AnthropicErrorWriter`） | 404 `not_found_error`，`The requested resource could not be found.`（官方 Error shapes 标准 404 报文，2026-09-18 按 platform.claude.com/docs/en/api/errors 核对；参考实现的 `Model %q is not available for this group` 已废弃） |
 | 池内有账号但都不支持该模型（伪造快照） | `classifyNoAccountError`（`no_account_error.go`，单点分类器，所有入口透传） | 404 `not_found_error`，`Model %q is not supported by any configured account in this group` |
 
+**new-api 移植口径（2026-09-18 定稿）**：`/v1/messages` 路径上，渠道选择失败的**两种形态**（lookup 出错 / 找不到可用渠道，涵盖"无能力行"与"有能力行但渠道不可用"）一律返回上表第一行的 404 通用报文，不再区分 503。e2e 的两个子场景（不存在模型 / 伪造快照）期望值相同。
+
 移植要点：
 - 分类器内部保留 `ModelNotFound` 布尔标志（ops 归因：routing/platform/local-model-config 阶段判定、不被 429 限流改判），**只改线上 ErrType 字符串**。
 - 例外保留：OpenAI 原生入口（GET `/v1/models` 单模型查询、白名单中间件的 OpenAI 路径）仍是 `code: "model_not_found"`（OpenAI 惯例，不属于 Anthropic 对齐范围）。
