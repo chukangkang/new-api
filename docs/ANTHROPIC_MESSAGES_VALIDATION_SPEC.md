@@ -56,7 +56,7 @@
 | R7 | `messages` 空数组 | `"messages" must be a non-empty array` |
 | R8 | `messages[i].role` 缺失 | `"messages[i].role" is a required property` |
 | R9 | `messages[i].role` 非字符串 | `"messages[i].role" must be a string` |
-| R10 | `messages[i].role` ∉ {user, assistant} | `"messages[i].role" must be one of: "user", "assistant"` |
+| R10 | `messages[i].role` ∉ {user, assistant, system}（真实 API 接受 role=system，2026-09-18 真伪验证实测 200） | `"messages[i].role" must be one of: "user", "assistant"` |
 | R11 | `messages[i].content` 缺失 | `"messages[i].content" is a required property` |
 
 ### 2.2 采样参数（分家族）
@@ -132,7 +132,7 @@
 | R31 | `output_config.effort` 非字符串 | `"output_config.effort" must be a string` |
 | R32 | effort ∉ {low, medium, high, xhigh, max} | `"output_config.effort" must be one of: "low", "medium", "high", "xhigh", "max"` |
 | R33 | effort 不在该模型支持级别内（分级表见下表） | `"output_config.effort" value "<v>" is not supported for this model` |
-| R34 | thinking.type=disabled 且 effort ∈ {xhigh, max} | `"thinking.type" value "disabled" is not supported with "output_config.effort" value "<effort>" for this model` |
+| R34 | thinking.type=disabled 且 effort ∈ {xhigh, max}，**仅限 Opus 5+（opus-5/sonnet-5/fable-5*/mythos-5*）**；Opus 4.8/4.7/4.6 等更早模型 disabled+xhigh 仍 200（2026-09-18 真伪验证实测） | `"thinking.type" value "disabled" is not supported with "output_config.effort" value "<effort>" for this model` |
 
 **R33 的 effort 分级表**（源自 `backend/internal/pkg/claude/effort_catalog.go` 的 `EffortLevelsForModel`，移植时整表照抄）：
 

@@ -81,13 +81,16 @@ func ValidateClaudeMessagesRequest(c *gin.Context) error {
 	if _, seekErr := storage.Seek(0, io.SeekStart); seekErr != nil {
 		return seekErr
 	}
-	if verr := ValidateAnthropicRequest(body, true, c.GetHeader("anthropic-beta")); verr != nil {
+	// count_tokens 端点豁免 max_tokens 必填（规范 §7.5）。
+	isCountTokens := strings.HasSuffix(c.Request.URL.Path, "/count_tokens")
+	requireMaxTokens := !isCountTokens
+	if verr := ValidateAnthropicRequest(body, requireMaxTokens, c.GetHeader("anthropic-beta")); verr != nil {
 		return WrapAnthropicValidationError(verr)
 	}
 	// thinking 块签名结构校验（可配置，默认开）：上游多数链路不验签，
 	// 网关自守门，客户端传了格式坏的签名（非 base64/过短）直接 400。
 	// 仅 /v1/messages 生效；count_tokens 端点不做此项。
-	if setting.ShouldValidateThinkingSignatures() {
+	if !isCountTokens && setting.ShouldValidateThinkingSignatures() {
 		if serr := ValidateThinkingSignatures(body); serr != nil {
 			return WrapAnthropicValidationError(serr)
 		}
@@ -169,7 +172,9 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		if role.Type != gjson.String {
 			return fmt.Errorf("\"messages[%d].role\" must be a string", i)
 		}
-		if role.Str != "user" && role.Str != "assistant" {
+		// 真实 API 对 messages 中的 role=system 返回 200（真伪验证实测），
+		// 故在 user/assistant 之外额外放行 system；其余角色仍 400。
+		if role.Str != "user" && role.Str != "assistant" && role.Str != "system" {
 			return fmt.Errorf("\"messages[%d].role\" must be one of: \"user\", \"assistant\"", i)
 		}
 		if !m.Get("content").Exists() {
@@ -330,7 +335,10 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 起不可关思考 ──
 	// 官方：Claude Opus 5 及之后模型在 xhigh/max effort 下无法关闭 thinking，
 	// 两者组合返回 400。低档 effort（≤high）允许 disabled。
-	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" {
+	// 注意：仅「Opus 5 及之后」（opus-5/sonnet-5/fable-5*/mythos-5*）受此约束；
+	// Opus 4.8 / 4.7 / 4.6 等更早模型 disabled + xhigh 仍可 200（真伪验证实测）。
+	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" &&
+		familyRejectsDisabledWithHighEffort(model.Str) {
 		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
 			if eff.Str == "xhigh" || eff.Str == "max" {
 				return errors.New(`"thinking.type" value "disabled" is not supported with "output_config.effort" value "` + eff.Str + `" for this model`)
@@ -508,6 +516,20 @@ func modelMaxOutputTokens(model string) (int, bool) {
 		return 64000, true
 	}
 	return 0, false
+}
+
+// familyRejectsDisabledWithHighEffort 判断模型是否属于「Opus 5 及之后」，
+// 即在 thinking.type=disabled 搭配 effort=xhigh/max 时应返回 400。
+// 仅 opus-5 / sonnet-5 / fable-5* / mythos-5* 受此约束；更早的
+// opus-4-8 / opus-4-7 / opus-4-6 等 disabled + xhigh 仍可 200（真伪验证实测）。
+func familyRejectsDisabledWithHighEffort(model string) bool {
+	switch normalizeThinkingModelFamily(model) {
+	case "claude-opus-5", "claude-sonnet-5",
+		"claude-fable-5", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-1":
+		return true
+	}
+	return false
 }
 
 // modelSupportsFastMode 判断模型是否支持 fast mode（speed=fast）。

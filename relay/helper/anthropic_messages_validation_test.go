@@ -139,10 +139,17 @@ func TestValidateAnthropicRequest_MessageRoleMissing(t *testing.T) {
 }
 
 func TestValidateAnthropicRequest_MessageRoleInvalid(t *testing.T) {
-	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "system", "content": "hi"}]}`
+	// role=system 真实 API 接受（200），故用一个真正非法的角色作样例。
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "bogus", "content": "hi"}]}`
 	err := ValidateAnthropicRequest([]byte(body), true, "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `"messages[0].role" must be one of: "user", "assistant"`)
+}
+
+func TestValidateAnthropicRequest_MessageRoleSystemAccepted(t *testing.T) {
+	// 真伪验证实测：真实 API 对 messages 中的 role=system 返回 200。
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "system", "content": "hi"}]}`
+	require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
 }
 
 func TestValidateAnthropicRequest_MessageContentMissing(t *testing.T) {
@@ -488,6 +495,14 @@ func TestValidateAnthropicRequest_DisabledWithHighEffortRejected(t *testing.T) {
 	// 不带 effort 的 disabled 放行
 	body := `{"model": "claude-opus-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`
 	require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+}
+
+func TestValidateAnthropicRequest_DisabledWithHighEffort_Opus48Accepted(t *testing.T) {
+	// 真伪验证实测：Opus 4.8 的 disabled + xhigh 返回 200（R34 仅限 Opus 5+）。
+	for _, effort := range []string{"xhigh", "max"} {
+		body := fmt.Sprintf(`{"model": "claude-opus-4-8", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "%s"}}`, effort)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""), "opus-4-8 disabled+%s should be accepted", effort)
+	}
 }
 
 func TestValidateAnthropicRequest_Thinking_Opus48_Sonnet5(t *testing.T) {

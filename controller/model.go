@@ -342,6 +342,18 @@ func RetrieveModel(c *gin.Context, modelType int) {
 			c.JSON(200, aiModel)
 		}
 	} else {
+		// Anthropic 官方对未知模型返回 404 not_found_error（HTTP 200 包错误体
+		// 会被真伪验证判为伪造）。OpenAI 入口保持既有 200 + error body 约定。
+		if modelType == constant.ChannelTypeAnthropic {
+			c.JSON(http.StatusNotFound, gin.H{
+				"type": "error",
+				"error": gin.H{
+					"type":    "not_found_error",
+					"message": "The requested resource could not be found.",
+				},
+			})
+			return
+		}
 		openAIError := types.OpenAIError{
 			Message: fmt.Sprintf("The model '%s' does not exist", modelId),
 			Type:    "invalid_request_error",

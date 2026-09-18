@@ -88,6 +88,11 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/messages", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatClaude)
 		})
+		// Anthropic Token Counting API：与 /v1/messages 共用校验（max_tokens 可选、
+		// 不做签名校验），转发到上游 /v1/messages/count_tokens。
+		httpRouter.POST("/messages/count_tokens", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatClaude)
+		})
 
 		// chat related routes
 		httpRouter.POST("/completions", func(c *gin.Context) {
