@@ -155,11 +155,11 @@ func Distribute() func(c *gin.Context) {
 						return
 					}
 					if channel == nil {
-						// Anthropic 对齐：/v1/messages 路径下，若所选分组内根本
-						// 没有任何渠道配置了该模型（持久性配置缺失），返回官方
-						// 404 not_found_error；有能力行但渠道暂时不可用时保持 503。
-						// auto 分组展开后无法确定单一分组，保持 503 不误判。
-						if isAnthropicMessagesPath(c.Request.URL.Path) && usingGroup != "auto" && !model.GroupHasModelAbility(usingGroup, modelRequest.Model) {
+						// Anthropic 对齐：/v1/messages 路径下，若所选分组（auto
+						// 分组则为其展开的全部候选分组）内根本没有配置该模型的
+						// 能力行（持久性配置缺失），返回官方 404 not_found_error；
+						// 有能力行但渠道暂时不可用时保持 503。
+						if isAnthropicMessagesPath(c.Request.URL.Path) && anthropicGroupLacksModel(c, usingGroup, modelRequest.Model) {
 							abortWithAnthropicNotFoundMessage(c, fmt.Sprintf("Model %q is not available for this group", modelRequest.Model))
 							return
 						}
@@ -182,6 +182,26 @@ func Distribute() func(c *gin.Context) {
 // 使用官方 not_found_error 报文；其他入口保持既有 OpenAI 风格。
 func isAnthropicMessagesPath(path string) bool {
 	return path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/")
+}
+
+// anthropicGroupLacksModel 判断指定分组是否都没有配置该模型的能力行。
+// 仅用于 /v1/messages 路径区分两类"无可用渠道"：
+//   - 持久性配置缺失（无任何能力行）→ 404 not_found_error
+//   - 有能力行但渠道暂时不可用 → 保持 503
+//
+// auto 分组会展开为用户可用的全部候选分组，只要任一分组配置了该模型
+// 就不视为缺失；全部缺失才返回 true。
+func anthropicGroupLacksModel(c *gin.Context, usingGroup, modelName string) bool {
+	if usingGroup == "auto" {
+		userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+		for _, g := range service.GetRequestAutoGroups(c, userGroup) {
+			if model.GroupHasModelAbility(g, modelName) {
+				return false
+			}
+		}
+		return true
+	}
+	return !model.GroupHasModelAbility(usingGroup, modelName)
 }
 
 // channelSupportsRequestPath reports whether a channel can serve the request path.
