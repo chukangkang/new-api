@@ -428,8 +428,10 @@ func TestValidateAnthropicRequest_ThinkingDisplayNotStringRejected(t *testing.T)
 // ── 按模型区分的 thinking.type 校验 ──
 
 func TestValidateAnthropicRequest_Thinking_FableMythos5Series(t *testing.T) {
-	// Fable 5.1 / Mythos 5.1 / Fable 5 / Mythos 5: adaptive + disabled
-	// （官方文档称拒绝 disabled，但实测矩阵 a10/a11 返回 200，按实测放宽）
+	// Fable 5.1 / Mythos 5.1 / Fable 5 / Mythos 5: 仅 adaptive。
+	// 官方文档（platform.claude.com/docs/en/api/errors "Thinking cannot be
+	// disabled"）：这四个模型 thinking 常开，disabled 返回 400。
+	// 早期参考实现按实测放宽（实测 200），2026-09-18 按官方文档收紧。
 	models := []string{
 		"claude-fable-5-1", "claude-mythos-5-1",
 		"claude-fable-5", "claude-mythos-5",
@@ -439,9 +441,11 @@ func TestValidateAnthropicRequest_Thinking_FableMythos5Series(t *testing.T) {
 			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
 			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
 		})
-		t.Run(model+"_disabled_ok", func(t *testing.T) {
+		t.Run(model+"_disabled_rejected", func(t *testing.T) {
 			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
-			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
 		})
 		t.Run(model+"_enabled_rejected", func(t *testing.T) {
 			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)

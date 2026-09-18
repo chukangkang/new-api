@@ -637,15 +637,18 @@ func assistantHasTextContent(msg gjson.Result) bool {
 // thinkingTypeRules maps normalized model family → allowed thinking.type values.
 // Normalization strips date suffixes (-20251101) and -thinking suffix.
 var thinkingTypeRules = map[string][]string{
+	// 自适应为主，thinking 常开 (仅 adaptive; enabled/disabled 均 400 拒绝)。
+	// 官方文档（platform.claude.com/docs/en/api/errors "Thinking cannot be
+	// disabled"）：Fable/Mythos 5.x 发送 thinking.type=disabled 返回 400。
+	// 早期参考实现按实测放宽（实测 200），2026-09-18 按官方文档收紧。
+	"claude-fable-5-1":  {"adaptive"},
+	"claude-mythos-5-1": {"adaptive"},
+	"claude-fable-5":    {"adaptive"},
+	"claude-mythos-5":   {"adaptive"},
+
 	// 自适应为主 (adaptive + disabled; 仅 enabled 被 400 拒绝)。
-	// 注：官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测这些模型对
-	// disabled 返回 200，故按实测放宽；Opus 5 官方明文接受 disabled
-	// （effort ≤ high 时）。
-	"claude-fable-5-1":  {"adaptive", "disabled"},
-	"claude-mythos-5-1": {"adaptive", "disabled"},
-	"claude-fable-5":    {"adaptive", "disabled"},
-	"claude-mythos-5":   {"adaptive", "disabled"},
-	"claude-opus-5":     {"adaptive", "disabled"},
+	// Opus 5 官方明文接受 disabled（effort ≤ high 时）。
+	"claude-opus-5": {"adaptive", "disabled"},
 
 	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
 	"claude-opus-4-8": {"adaptive", "disabled"},

@@ -82,8 +82,8 @@
 
 | 模型家族 | 允许 thinking.type | 400 拒绝 |
 |----------|--------------------|----------|
-| claude-fable-5-1 / fable-5 | adaptive, disabled* | enabled |
-| claude-mythos-5-1 / mythos-5 | adaptive, disabled* | enabled |
+| claude-fable-5-1 / fable-5 | adaptive | enabled, disabled |
+| claude-mythos-5-1 / mythos-5 | adaptive | enabled, disabled |
 | claude-opus-5 | adaptive, disabled | enabled |
 | claude-opus-4-8 / opus-4-7 | adaptive, disabled | enabled |
 | claude-sonnet-5 | adaptive, disabled | enabled |
@@ -92,7 +92,7 @@
 | claude-opus-4-6 / sonnet-4-6 | 不限（enabled 已弃用但仍可用） | 无 |
 | 未知模型 | 三种全收（向后兼容） | 无 |
 
-\* 官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测返回 200，按实测放宽（移植时可保留此决策或按官方收紧，二选一并留注释）。
+\* 官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测返回 200，参考实现曾按实测放宽；2026-09-18 起按官方文档收紧为 400（见 platform.claude.com/docs/en/api/errors "Thinking cannot be disabled"）。
 
 拒绝时的**官方逐字文案**（按被拒的值区分）：
 
@@ -316,7 +316,7 @@ thinkingSignatureMinDecodedLen = 32
 ## 7. 移植注意事项（踩过的坑）
 
 1. **文案逐字**：客户端（Claude Code 等）和部分上游按错误文案分支处理，标点/反引号都不能差。
-2. **Fable/Mythos 5.x 的 disabled**：官方文档与实测矛盾，本实现按实测放宽；移植时定一个口径并在代码注释里写明依据。
+2. **Fable/Mythos 5.x 的 disabled**：官方文档与实测矛盾（文档 400，实测 200）。参考实现曾按实测放宽；new-api 移植版 2026-09-18 起按官方文档收紧为 400，代码注释已写明依据。
 3. **prefill 判定**：只有"最后一条 assistant 消息含**文本**"才算 prefill；只含 tool_use 等结构化块的不算，放行给上游。
 4. **未知模型一律放行**（thinking.type、max_tokens 上限、fast mode 之外的未知项），宁可漏拦不可误杀。
 5. **count_tokens 豁免**：max_tokens 必填、budget<max 比较、签名校验三项都不适用。
