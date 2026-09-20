@@ -186,11 +186,7 @@
   其中 `type ∈ {thinking, redacted_thinking}` 的块：
   - `signature` 缺失 / 非字符串 / 空串 → **放行**（交给既有的"缺签名预过滤 + 400 整流"链路，避免双重拦截）
   - `signature` 非空 → 必须满足：
-    1. 是合法 base64。解码采用**宽容策略**（`decodeSignatureBase64`）：依次尝试
-       StdEncoding / URLEncoding / RawStdEncoding / RawURLEncoding，全部失败再
-       剔除空白（换行/空格/tab）后重试一轮。目的是兼容不同上游/客户端的编码
-       差异（有无 padding、URL-safe 字母表、被折行的长签名），贯彻"宁可漏拦
-       不可误杀"。
+    1. 是合法 base64（StdEncoding，失败再试 URLEncoding）
        否则：`Invalid \`signature\` in \`thinking\` block`
     2. 解码后 ≥ **32 字节**
        否则：`Invalid \`signature\` in \`thinking\` block: signature is too short`
