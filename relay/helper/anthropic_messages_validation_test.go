@@ -5,6 +5,7 @@ package helper
 // 全部用例直接搬来做回归，保护官方对齐的校验契约。
 
 import (
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"testing"
@@ -895,19 +896,39 @@ func sigLenDelim(field int, payload []byte) []byte {
 	return append(out, payload...)
 }
 
-// buildValidSigSkeleton 构造一个符合官方 thinking 签名骨架的字节序列：
+// buildSigMetadata 按真实签名的元数据布局构造内层 field1 内容：
+// varint 版本号 + 模型名 ASCII + "thinking" 常量 + UUID + 填充至 167 字节。
+func buildSigMetadata(model string) []byte {
+	meta := []byte{}
+	meta = append(meta, sigVarint(2)...) // 内嵌版本号（真实样本为 2）
+	meta = append(meta, []byte(model)...)
+	meta = append(meta, 0x00) // 分隔符：真实签名里模型名与 "thinking" 间有非打印字节
+	meta = append(meta, []byte("thinking")...)
+	meta = append(meta, []byte("01234567-89ab-4cde-8f01-23456789abcd")...)
+	for len(meta) < 167 {
+		meta = append(meta, 0xff)
+	}
+	return meta
+}
+
+// buildValidSigSkeleton 构造一个符合官方 thinking 签名骨架+深度指纹的字节序列：
 //
 //	outer: field1 varint=2 | field2 bytes=<inner> | field3 varint=1
-//	inner: field1..field5 均为 len-delimited（良构）
+//	inner: field1=元数据(含模型名/thinking/UUID) | field2..4 短块 | field5=密文主体
 //
-// 返回其 base64 字符串。该骨架与真实签名外层结构一致，可通过严格骨架校验。
+// 返回其 base64 字符串。结构与真实签名（fable-5 / opus-4-8 解剖结果）一致，
+// 可通过严格骨架校验与深度指纹校验。
 func buildValidSigSkeleton() string {
+	return buildValidSigSkeletonForModel("claude-opus-5")
+}
+
+func buildValidSigSkeletonForModel(model string) string {
 	var inner []byte
-	inner = append(inner, sigLenDelim(1, make([]byte, 166))...)
+	inner = append(inner, sigLenDelim(1, buildSigMetadata(model))...)
 	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
 	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
 	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
-	inner = append(inner, sigLenDelim(5, make([]byte, 64))...)
+	inner = append(inner, sigLenDelim(5, make([]byte, 300))...)
 
 	var outer []byte
 	outer = append(outer, sigTag(1, 0))
@@ -932,6 +953,84 @@ func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
 		{"role": "user", "content": "hi"}
 	]}`, buildValidSigSkeleton())
 	require.NoError(t, ValidateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_DeepFingerprintCases(t *testing.T) {
+	mkBody := func(sig, model string) []byte {
+		return []byte(fmt.Sprintf(`{"model": %q, "max_tokens": 100, "messages": [
+			{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": %q}]},
+			{"role": "user", "content": "hi"}
+		]}`, model, sig))
+	}
+
+	// 基线：模型匹配的完整签名应通过
+	require.NoError(t, ValidateThinkingSignatures(mkBody(buildValidSigSkeletonForModel("claude-opus-5"), "claude-opus-5")))
+
+	// 跨模型重放：签名元数据里的模型名与请求模型不一致 -> malformed
+	err := ValidateThinkingSignatures(mkBody(buildValidSigSkeletonForModel("claude-sonnet-4-6"), "claude-opus-5"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "malformed")
+
+	// 模型名大小写不敏感
+	require.NoError(t, ValidateThinkingSignatures(mkBody(buildValidSigSkeletonForModel("claude-opus-5"), "Claude-Opus-5")))
+
+	// 元数据缺少 UUID -> malformed（替换串与原串等长，避免位移其他字段）
+	sigNoUUID := buildSigMetadataWithout(func(m []byte) []byte {
+		return bytes.Replace(m, []byte("01234567-89ab-4cde-8f01-23456789abcd"), []byte("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"), 1)
+	})
+	err = ValidateThinkingSignatures(mkBody(sigNoUUID, "claude-opus-5"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "malformed")
+
+	// 元数据缺少 "thinking" 标识 -> malformed
+	sigNoMarker := buildSigMetadataWithout(func(m []byte) []byte {
+		return bytes.Replace(m, []byte("thinking"), []byte("thinkXXX"), 1)
+	})
+	err = ValidateThinkingSignatures(mkBody(sigNoMarker, "claude-opus-5"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "malformed")
+
+	// 密文主体过短（< 256B）-> malformed
+	sigShortBlob := buildSigWithBlobLen(64)
+	err = ValidateThinkingSignatures(mkBody(sigShortBlob, "claude-opus-5"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "malformed")
+}
+
+// buildSigMetadataWithout 用 mutate 变换元数据后重建完整签名。
+func buildSigMetadataWithout(mutate func([]byte) []byte) string {
+	var inner []byte
+	inner = append(inner, sigLenDelim(1, mutate(buildSigMetadata("claude-opus-5")))...)
+	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
+	inner = append(inner, sigLenDelim(5, make([]byte, 300))...)
+
+	var outer []byte
+	outer = append(outer, sigTag(1, 0))
+	outer = append(outer, sigVarint(2)...) // 版本标记
+	outer = append(outer, sigLenDelim(2, inner)...)
+	outer = append(outer, sigTag(3, 0))
+	outer = append(outer, sigVarint(1)...) // 尾部字段
+	return base64.StdEncoding.EncodeToString(outer)
+}
+
+// buildSigWithBlobLen 构造指定密文主体长度的完整签名（模型 claude-opus-5）。
+func buildSigWithBlobLen(blobLen int) string {
+	var inner []byte
+	inner = append(inner, sigLenDelim(1, buildSigMetadata("claude-opus-5"))...)
+	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
+	inner = append(inner, sigLenDelim(5, make([]byte, blobLen))...)
+
+	var outer []byte
+	outer = append(outer, sigTag(1, 0))
+	outer = append(outer, sigVarint(2)...) // 版本标记
+	outer = append(outer, sigLenDelim(2, inner)...)
+	outer = append(outer, sigTag(3, 0))
+	outer = append(outer, sigVarint(1)...) // 尾部字段
+	return base64.StdEncoding.EncodeToString(outer)
 }
 
 func TestValidateThinkingSignatures_TamperedFirstByteRejected(t *testing.T) {

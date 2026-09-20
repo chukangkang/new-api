@@ -16,10 +16,12 @@ package helper
 //   - 纯结构校验，不做密码学验签（网关没有 Anthropic 私钥）。
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -111,6 +113,16 @@ const BetaInterleavedThinking = "interleaved-thinking-2025-05-14"
 // 明显偏短的签名通常是截断/损坏。取 32 字节作为下限：既能拦住明显的坏签名，
 // 又不会误伤合法的较短签名。
 const thinkingSignatureMinDecodedLen = 32
+
+// thinkingSigInnerMetaMinLen 是签名内层 field1（元数据容器）的最小字节数。
+// 真实样本（fable-5 / opus-4-8）实测为 167~168 字节；低于该值的"内层"
+// 几乎必然是伪造或截断。
+const thinkingSigInnerMetaMinLen = 128
+
+// thinkingSigInnerBlobMinLen 是签名内层 field5（密文主体）的最小字节数。
+// 真实样本实测 1137~1840 字节；密文主体承载对 thinking 内容的签名，
+// 过短意味着内容覆盖不足或伪造。
+const thinkingSigInnerBlobMinLen = 256
 
 // isClaudeFamilyModel 判断请求的模型是否属于 Claude 家族
 // （claude-* / opus-* / sonnet-* / haiku-*）。
@@ -371,13 +383,16 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 //   - signature 存在且非空：必须是合法 base64，且解码后不少于
 //     thinkingSignatureMinDecodedLen 字节，否则返回 400 风格错误。
 //
-// 该检查是纯结构性的：它只能识别"格式坏了"的签名（空/截断/乱码/非 base64），
-// 无法识别"格式合法但内容被篡改"的签名（网关没有 Anthropic 密钥，做不了密码学
-// 验签）。因此对"上游每轮签发新签名"这一正常情形天然免疫——只要新签名格式合法
-// 就会放行，不会因为"和上一次不一样"而被误杀。
+// 该检查是纯结构性的（骨架 + 深度指纹，见 checkThinkingSignatureFormat）：
+// 能识别"格式坏了"的签名（空/截断/乱码/非 base64）、结构损坏、元数据缺失
+// （thinking 标识/UUID/模型名）以及跨模型重放；但无法识别密文主体内部的
+// 逐字节篡改（网关没有 Anthropic 密钥，做不了密码学验签）。因此对"上游每轮
+// 签发新签名"这一正常情形天然免疫——只要新签名结构合法且模型名一致就会放行。
 //
 // 作用域：仅 /v1/messages，count_tokens 不做。
 func ValidateThinkingSignatures(body []byte) error {
+	// 模型名取自请求体顶层（跨模型重放校验用）；缺失时留空，深度校验跳过该项。
+	modelName := gjson.GetBytes(body, "model").Str
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return nil
@@ -402,7 +417,7 @@ func ValidateThinkingSignatures(body []byte) error {
 			// 严格骨架校验仅作用于 thinking 块；redacted_thinking 的签名结构
 			// 尚未取样确认，沿用宽松的 base64+长度校验，避免误杀。
 			strict := btype == "thinking"
-			if err := checkThinkingSignatureFormat(sig.Str, strict); err != nil {
+			if err := checkThinkingSignatureFormat(sig.Str, strict, modelName); err != nil {
 				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
 			}
 		}
@@ -413,12 +428,15 @@ func ValidateThinkingSignatures(body []byte) error {
 // checkThinkingSignatureFormat 校验单个签名字符串的结构合法性。
 // 错误文案对齐官方 "Invalid `signature` in `thinking` block" 的风格。
 //
-// strict 为 true（thinking 块）时，在 base64+长度校验之上追加官方 protobuf
-// 骨架校验：解码后的字节必须是良构的 protobuf，且外层需含 field1（版本标记，
-// varint）与 field2（内层，本身也须良构）。这能识别"格式合法但首字节被篡改"
-// 的签名（如把外层 field1 的 tag 0x08 改成 0x04 变成 field0），而真签名与
-// 高仿签名都满足该骨架。strict 为 false（redacted_thinking）时仅做基础校验。
-func checkThinkingSignatureFormat(sig string, strict bool) error {
+// strict 为 true（thinking 块）时，在 base64+长度校验之上追加两层结构校验：
+//  1. 外层 protobuf 骨架：必须是良构 protobuf，且含 field1（版本标记，varint）
+//     与 field2（内层，本身也须良构）——识别"格式合法但首字节被篡改"的签名；
+//  2. 深度指纹（reverse-engineered，见 isValidThinkingSignatureDeep）：内层
+//     field1 元数据容器须含 "thinking" 标识与 UUID，且当 modelName 非空时
+//     元数据中的模型名必须与请求模型一致——识别跨模型重放的签名。
+//
+// strict 为 false（redacted_thinking）时仅做基础校验。
+func checkThinkingSignatureFormat(sig string, strict bool, modelName string) error {
 	const badBase64 = "Invalid `signature` in `thinking` block"
 	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
 	const malformed = "Invalid `signature` in `thinking` block: signature is malformed"
@@ -435,7 +453,7 @@ func checkThinkingSignatureFormat(sig string, strict bool) error {
 	if len(decoded) < thinkingSignatureMinDecodedLen {
 		return errors.New(tooShort)
 	}
-	if strict && !isValidThinkingSignatureSkeleton(decoded) {
+	if strict && (!isValidThinkingSignatureSkeleton(decoded) || !isValidThinkingSignatureDeep(decoded, modelName)) {
 		return errors.New(malformed)
 	}
 	return nil
@@ -545,6 +563,185 @@ func protoWellFormed(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// thinkingSigUUIDRe 匹配标准 UUID（小写十六进制，8-4-4-4-12）。
+var thinkingSigUUIDRe = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+
+// isValidThinkingSignatureDeep 对解码后的 thinking 签名做深度结构指纹校验。
+//
+// 依据对真实签名的离线解剖（fable-5 / opus-4-8，2026-09-20），签名解码后
+// 的稳定结构如下（外层 field2 之内）：
+//
+//	inner.field1 bytes(~167B)  元数据容器：内嵌 varint 版本号 + 模型名 ASCII
+//	                            （如 "claude-opus-4-8"）+ "thinking" 常量 +
+//	                            每次签发变化的 UUID
+//	inner.field2 bytes(12)     低熵短块（疑似时间戳/nonce）
+//	inner.field3 bytes(12)     低熵短块
+//	inner.field4 bytes(48)     中等熵块（疑似摘要）
+//	inner.field5 bytes(1k+)    高熵密文主体（对 thinking 内容的签名）
+//
+// 本函数锁定其中跨样本稳定的不变量（不含逐字节敏感的密文）：
+//  1. 内层 field1 存在且长度 >= thinkingSigInnerMetaMinLen；
+//  2. field1 内含 "thinking" 标识（ASCII 明文）；
+//  3. field1 内含至少一个标准 UUID（每次签发变化，但格式恒定）；
+//  4. 内层 field5 存在且长度 >= thinkingSigInnerBlobMinLen（密文主体）；
+//  5. modelName 非空时，field1 内的模型名必须与请求模型一致（大小写不敏感）
+//     ——拦截"拿 A 模型的签名塞进 B 模型请求"的跨模型重放。
+//
+// 局限：仍非密码学验签——密文主体内部改一两个字节检测不到（那需要上游密钥）；
+// 但相比纯骨架校验，可额外拦截"结构完整但元数据不符/模型不符"的高仿签名。
+func isValidThinkingSignatureDeep(b []byte, modelName string) bool {
+	meta, blob, ok := extractThinkingSignatureParts(b)
+	if !ok {
+		return false
+	}
+	if len(meta) < thinkingSigInnerMetaMinLen {
+		return false
+	}
+	if !bytes.Contains(meta, []byte("thinking")) {
+		return false
+	}
+	if !thinkingSigUUIDRe.Match(meta) {
+		return false
+	}
+	if len(blob) < thinkingSigInnerBlobMinLen {
+		return false
+	}
+	if mn := strings.ToLower(strings.TrimSpace(modelName)); mn != "" {
+		if !modelRunMatchesAny(mn, meta) {
+			return false
+		}
+	}
+	return true
+}
+
+// modelRunMatchesAny 判断元数据的可打印连续段中是否存在与模型名一致的段。
+// 真实签名里模型名与相邻字段的 tag/长度字节常常粘连成一个更长的连续段
+// （如 "claude-opus-5" 后紧跟 0x38 显示为 "claude-opus-58"），因此除精确
+// 相等外，还接受"模型名前缀 + 数字/-/_ 边界"的形式；字母边界不算（避免
+// "claude-opus-5" 误配 "claude-opus-5x" 这类假想更长模型名）。
+func modelRunMatchesAny(mn string, meta []byte) bool {
+	for _, cand := range printableRuns(meta) {
+		cs := strings.ToLower(string(cand))
+		if cs == mn {
+			return true
+		}
+		if strings.HasPrefix(cs, mn) {
+			next := cs[len(mn)]
+			if (next >= '0' && next <= '9') || next == '-' || next == '_' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractThinkingSignatureParts 解析签名外层 field2（内层），返回内层
+// field1（元数据容器）与 field5（密文主体）的原始字节。
+// 任一步不符合预期结构返回 ok=false。
+func extractThinkingSignatureParts(b []byte) (meta, blob []byte, ok bool) {
+	// 外层：定位 field2（wire 2）
+	i := 0
+	for i < len(b) {
+		tag := b[i]
+		field := int(tag >> 3)
+		wire := int(tag & 7)
+		i++
+		switch wire {
+		case 0:
+			n, err := protoVarintLen(b[i:])
+			if err != nil {
+				return nil, nil, false
+			}
+			i += n
+		case 1:
+			if i+8 > len(b) {
+				return nil, nil, false
+			}
+			i += 8
+		case 5:
+			if i+4 > len(b) {
+				return nil, nil, false
+			}
+			i += 4
+		case 2:
+			l, n, err := protoVarint(b[i:])
+			if err != nil || i+n+int(l) > len(b) {
+				return nil, nil, false
+			}
+			payload := b[i+n : i+n+int(l)]
+			if field == 2 {
+				// 内层：遍历收集 field1 与 field5
+				j := 0
+				for j < len(payload) {
+					stag := payload[j]
+					sfield := int(stag >> 3)
+					swire := int(stag & 7)
+					j++
+					switch swire {
+					case 0:
+						n, err := protoVarintLen(payload[j:])
+						if err != nil {
+							return nil, nil, false
+						}
+						j += n
+					case 1:
+						if j+8 > len(payload) {
+							return nil, nil, false
+						}
+						j += 8
+					case 5:
+						if j+4 > len(payload) {
+							return nil, nil, false
+						}
+						j += 4
+					case 2:
+						l2, n2, err := protoVarint(payload[j:])
+						if err != nil || j+n2+int(l2) > len(payload) {
+							return nil, nil, false
+						}
+						seg := payload[j+n2 : j+n2+int(l2)]
+						if sfield == 1 && meta == nil {
+							meta = seg
+						} else if sfield == 5 && blob == nil {
+							blob = seg
+						}
+						j += n2 + int(l2)
+					default:
+						return nil, nil, false
+					}
+				}
+				return meta, blob, true
+			}
+			i += n + int(l)
+		default:
+			return nil, nil, false
+		}
+	}
+	return nil, nil, false
+}
+
+// printableRuns 提取 b 中所有长度 >= 4 的可打印 ASCII 连续段。
+// 签名元数据里的模型名/常量以明文嵌入在二进制之间，用连续段枚举
+// 再逐一比对，避免依赖确切偏移。
+func printableRuns(b []byte) [][]byte {
+	var runs [][]byte
+	start := -1
+	for i := 0; i <= len(b); i++ {
+		isPrint := i < len(b) && b[i] >= 0x20 && b[i] <= 0x7e
+		if isPrint {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 && i-start >= 4 {
+			runs = append(runs, b[start:i])
+		}
+		start = -1
+	}
+	return runs
 }
 
 // protoVarint 读取一个 varint，返回值与其占用的字节数。

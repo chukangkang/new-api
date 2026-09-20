@@ -29,16 +29,16 @@ func TestRealProbeSignatures_SkeletonValidation(t *testing.T) {
 	}
 	require.Len(t, sigs, 3, "expected SIGNATURE, SIGNATURE1, SIGNATURE2")
 
-	// 正确签名：应通过严格骨架校验
-	require.NoError(t, checkThinkingSignatureFormat(sigs["SIGNATURE"], true), "real signature should pass")
+	// 正确签名：应通过严格骨架校验 + 深度指纹校验（含模型名一致性）
+	require.NoError(t, checkThinkingSignatureFormat(sigs["SIGNATURE"], true, "claude-opus-5"), "real signature should pass")
 
 	// SIGNATURE1：前导加 C，长度 mod4!=0 -> 非法 base64
-	err = checkThinkingSignatureFormat(sigs["SIGNATURE1"], true)
+	err = checkThinkingSignatureFormat(sigs["SIGNATURE1"], true, "claude-opus-5")
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "Invalid `signature` in `thinking` block"), "got: %v", err)
 
 	// SIGNATURE2：首字节 0x08->0x04，base64 合法但骨架 malformed
-	err = checkThinkingSignatureFormat(sigs["SIGNATURE2"], true)
+	err = checkThinkingSignatureFormat(sigs["SIGNATURE2"], true, "claude-opus-5")
 	require.Error(t, err)
 	require.True(t, strings.Contains(err.Error(), "malformed"), "got: %v", err)
 }
