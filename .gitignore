@@ -48,3 +48,6 @@ build_release.sh
 probe_min.json
 probe_models.sh
 probe_access.sh
+
+# Scratch signature-dump workspace (contains live API keys).
+_tmp_sigdump/

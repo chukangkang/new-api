@@ -399,7 +399,10 @@ func ValidateThinkingSignatures(body []byte) error {
 			if !sig.Exists() || sig.Type != gjson.String || sig.Str == "" {
 				continue
 			}
-			if err := checkThinkingSignatureFormat(sig.Str); err != nil {
+			// 严格骨架校验仅作用于 thinking 块；redacted_thinking 的签名结构
+			// 尚未取样确认，沿用宽松的 base64+长度校验，避免误杀。
+			strict := btype == "thinking"
+			if err := checkThinkingSignatureFormat(sig.Str, strict); err != nil {
 				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
 			}
 		}
@@ -409,9 +412,16 @@ func ValidateThinkingSignatures(body []byte) error {
 
 // checkThinkingSignatureFormat 校验单个签名字符串的结构合法性。
 // 错误文案对齐官方 "Invalid `signature` in `thinking` block" 的风格。
-func checkThinkingSignatureFormat(sig string) error {
+//
+// strict 为 true（thinking 块）时，在 base64+长度校验之上追加官方 protobuf
+// 骨架校验：解码后的字节必须是良构的 protobuf，且外层需含 field1（版本标记，
+// varint）与 field2（内层，本身也须良构）。这能识别"格式合法但首字节被篡改"
+// 的签名（如把外层 field1 的 tag 0x08 改成 0x04 变成 field0），而真签名与
+// 高仿签名都满足该骨架。strict 为 false（redacted_thinking）时仅做基础校验。
+func checkThinkingSignatureFormat(sig string, strict bool) error {
 	const badBase64 = "Invalid `signature` in `thinking` block: signature is not valid base64"
 	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
+	const malformed = "Invalid `signature` in `thinking` block: signature is malformed"
 
 	decoded, err := base64.StdEncoding.DecodeString(sig)
 	if err != nil {
@@ -425,7 +435,140 @@ func checkThinkingSignatureFormat(sig string) error {
 	if len(decoded) < thinkingSignatureMinDecodedLen {
 		return errors.New(tooShort)
 	}
+	if strict && !isValidThinkingSignatureSkeleton(decoded) {
+		return errors.New(malformed)
+	}
 	return nil
+}
+
+// isValidThinkingSignatureSkeleton 校验解码后的签名是否符合官方 thinking
+// 签名的 protobuf 骨架：
+//
+//	outer: field1 varint（版本标记） + field2 bytes（内层，须良构） [+ 尾随字段]
+//
+// 判定要点：
+//   - 整个外层必须是良构 protobuf（能被完整消费，无越界/坏 tag）；
+//   - 必须出现 field1 且为 varint（wire 0）——这是版本标记，真签名恒为 2；
+//   - 必须出现 field2 且为 len-delimited（wire 2），其内容本身也须良构。
+//
+// 任一不满足即视为 malformed。该校验刻意宽松于"逐字段比对"，只锁定官方
+// 签名稳定不变的外层骨架，从而既拦下首字节篡改，又不误伤合法签名。
+func isValidThinkingSignatureSkeleton(b []byte) bool {
+	hasVersion := false
+	hasInner := false
+	i := 0
+	for i < len(b) {
+		tag := b[i]
+		field := int(tag >> 3)
+		wire := int(tag & 7)
+		i++
+		if field == 0 {
+			// field0 不是合法 protobuf 字段号；真签名外层从 field1 开始。
+			return false
+		}
+		switch wire {
+		case 0: // varint
+			n, err := protoVarintLen(b[i:])
+			if err != nil {
+				return false
+			}
+			i += n
+			if field == 1 {
+				hasVersion = true
+			}
+		case 1: // fixed64
+			if i+8 > len(b) {
+				return false
+			}
+			i += 8
+		case 5: // fixed32
+			if i+4 > len(b) {
+				return false
+			}
+			i += 4
+		case 2: // len-delimited
+			l, n, err := protoVarint(b[i:])
+			if err != nil || i+n+int(l) > len(b) {
+				return false
+			}
+			payload := b[i+n : i+n+int(l)]
+			if field == 2 {
+				hasInner = true
+				if !protoWellFormed(payload) {
+					return false
+				}
+			}
+			i += n + int(l)
+		default:
+			return false
+		}
+	}
+	return hasVersion && hasInner
+}
+
+// protoWellFormed 判断 b 是否为良构 protobuf（能被从头到尾完整消费）。
+func protoWellFormed(b []byte) bool {
+	i := 0
+	for i < len(b) {
+		tag := b[i]
+		field := int(tag >> 3)
+		wire := int(tag & 7)
+		i++
+		if field == 0 || field > 536870912 {
+			return false
+		}
+		switch wire {
+		case 0:
+			n, err := protoVarintLen(b[i:])
+			if err != nil {
+				return false
+			}
+			i += n
+		case 1:
+			if i+8 > len(b) {
+				return false
+			}
+			i += 8
+		case 5:
+			if i+4 > len(b) {
+				return false
+			}
+			i += 4
+		case 2:
+			l, n, err := protoVarint(b[i:])
+			if err != nil || i+n+int(l) > len(b) {
+				return false
+			}
+			i += n + int(l)
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// protoVarint 读取一个 varint，返回值与其占用的字节数。
+func protoVarint(b []byte) (uint64, int, error) {
+	var v uint64
+	var shift uint
+	for i := 0; i < len(b) && i < 10; i++ {
+		v |= uint64(b[i]&0x7f) << shift
+		if b[i]&0x80 == 0 {
+			return v, i + 1, nil
+		}
+		shift += 7
+	}
+	return 0, 0, errors.New("bad varint")
+}
+
+// protoVarintLen 返回一个 varint 占用的字节数（不关心其数值）。
+func protoVarintLen(b []byte) (int, error) {
+	for i := 0; i < len(b) && i < 10; i++ {
+		if b[i]&0x80 == 0 {
+			return i + 1, nil
+		}
+	}
+	return 0, errors.New("bad varint")
 }
 
 // allEffortLevels 是官方 output_config.effort 的全部合法取值。

@@ -5,6 +5,7 @@ package helper
 // 全部用例直接搬来做回归，保护官方对齐的校验契约。
 
 import (
+	"encoding/base64"
 	"fmt"
 	"testing"
 
@@ -874,15 +875,93 @@ func TestValidateAnthropicRequest_SpeedStandardAlwaysAccepted(t *testing.T) {
 
 // ── thinking 块签名结构校验 ──
 
-// longValidSig 是一个合法 base64、解码后远超最小长度的签名（模拟真实签名）。
-const longValidSig = "CAISuyMKpgEIERgCKkCozyv1jDNFSU1VkqYoVveGjyGIeEuG7iAuUN2RtIb6MXhssIMBOlwsr+v0knDmsgp7nWdfdTC7"
+// sigTag 拼接一个 protobuf tag 字节。
+func sigTag(field, wire int) byte { return byte((field << 3) | wire) }
+
+// sigVarint 把一个 uint64 编码为 protobuf varint 字节序列。
+func sigVarint(v uint64) []byte {
+	out := []byte{}
+	for v >= 0x80 {
+		out = append(out, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(out, byte(v))
+}
+
+// sigLenDelim 编码一个 len-delimited 字段（wire 2）。
+func sigLenDelim(field int, payload []byte) []byte {
+	out := []byte{sigTag(field, 2)}
+	out = append(out, sigVarint(uint64(len(payload)))...)
+	return append(out, payload...)
+}
+
+// buildValidSigSkeleton 构造一个符合官方 thinking 签名骨架的字节序列：
+//
+//	outer: field1 varint=2 | field2 bytes=<inner> | field3 varint=1
+//	inner: field1..field5 均为 len-delimited（良构）
+//
+// 返回其 base64 字符串。该骨架与真实签名外层结构一致，可通过严格骨架校验。
+func buildValidSigSkeleton() string {
+	var inner []byte
+	inner = append(inner, sigLenDelim(1, make([]byte, 166))...)
+	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
+	inner = append(inner, sigLenDelim(5, make([]byte, 64))...)
+
+	var outer []byte
+	outer = append(outer, sigTag(1, 0))
+	outer = append(outer, sigVarint(2)...) // 版本标记
+	outer = append(outer, sigLenDelim(2, inner)...)
+	outer = append(outer, sigTag(3, 0))
+	outer = append(outer, sigVarint(1)...)
+	return base64.StdEncoding.EncodeToString(outer)
+}
+
+// tamperedFirstByteSig 返回首字节被篡改（0x08 -> 0x04，外层 field1 退化为
+// field0）的签名 base64，用于验证严格骨架校验能识别"格式合法但首字节被改"。
+func tamperedFirstByteSig() string {
+	raw, _ := base64.StdEncoding.DecodeString(buildValidSigSkeleton())
+	raw[0] = 0x04 // field0, wire4 -> 外层骨架非法
+	return base64.StdEncoding.EncodeToString(raw)
+}
 
 func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
 	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
 		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
 		{"role": "user", "content": "hi"}
-	]}`, longValidSig)
+	]}`, buildValidSigSkeleton())
 	require.NoError(t, ValidateThinkingSignatures([]byte(body)))
+}
+
+func TestValidateThinkingSignatures_TamperedFirstByteRejected(t *testing.T) {
+	// 首字节 0x08->0x04 使外层 field1 变成 field0：base64 合法、长度充足，
+	// 但骨架校验应判为 malformed 并 400。
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, tamperedFirstByteSig())
+	err := ValidateThinkingSignatures([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "messages.0.content.0")
+	require.Contains(t, err.Error(), "malformed")
+}
+
+func TestValidateThinkingSignatures_MissingVersionFieldRejected(t *testing.T) {
+	// 外层缺少 field1（版本标记）：仅有 field2 内层，骨架不完整。
+	// 内层放大到足以越过 32 字节长度阈值，确保走到骨架校验而非 too short。
+	var inner []byte
+	inner = append(inner, sigLenDelim(1, make([]byte, 64))...)
+	var outer []byte
+	outer = append(outer, sigLenDelim(2, inner)...)
+	sig := base64.StdEncoding.EncodeToString(outer)
+	body := fmt.Sprintf(`{"model": "claude-opus-5", "max_tokens": 100, "messages": [
+		{"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm", "signature": "%s"}]},
+		{"role": "user", "content": "hi"}
+	]}`, sig)
+	err := ValidateThinkingSignatures([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "malformed")
 }
 
 func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {

@@ -210,6 +210,63 @@ func (e *NewAPIError) ToOpenAIError() OpenAIError {
 	return result
 }
 
+// officialClaudeErrorTypes 是 Anthropic 官方文档定义的全部 error.type 取值。
+var officialClaudeErrorTypes = map[string]bool{
+	"invalid_request_error":      true,
+	"authentication_error":       true,
+	"permission_error":           true,
+	"billing_error":              true,
+	"not_found_error":            true,
+	"conflict_error":             true,
+	"request_too_large":          true,
+	"unprocessable_entity_error": true,
+	"rate_limit_error":           true,
+	"overloaded_error":           true,
+	"timeout_error":              true,
+	"internal_server_error":      true,
+	"api_error":                  true,
+}
+
+// claudeErrorTypeForStatus 按 HTTP 状态码推导官方 error.type。
+func claudeErrorTypeForStatus(statusCode int) string {
+	switch statusCode {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusPaymentRequired:
+		return "billing_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusConflict:
+		return "conflict_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable_entity_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case 529:
+		return "overloaded_error"
+	case http.StatusGatewayTimeout:
+		return "timeout_error"
+	default:
+		return "api_error"
+	}
+}
+
+// normalizeClaudeErrorType 确保 error.type 落在官方类型集合内：
+// 已是官方类型则原样保留（如真上游 Anthropic 的错误），否则按状态码归一化，
+// 避免把内部类型名（new_api_error、openai_error）或 "<nil>" 泄漏给客户端。
+func normalizeClaudeErrorType(rawType string, statusCode int) string {
+	if officialClaudeErrorTypes[rawType] {
+		return rawType
+	}
+	return claudeErrorTypeForStatus(statusCode)
+}
+
 func (e *NewAPIError) ToClaudeError() ClaudeError {
 	var result ClaudeError
 	switch e.errorType {
@@ -217,7 +274,7 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 		if openAIError, ok := e.RelayError.(OpenAIError); ok {
 			result = ClaudeError{
 				Message: e.Error(),
-				Type:    fmt.Sprintf("%v", openAIError.Code),
+				Type:    openAIError.Type,
 			}
 		}
 	case ErrorTypeClaudeError:
@@ -230,6 +287,7 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 			Type:    string(e.errorType),
 		}
 	}
+	result.Type = normalizeClaudeErrorType(result.Type, e.StatusCode)
 	if e.errorCode != ErrorCodeCountTokenFailed {
 		result.Message = kitutil.MaskSensitiveInfo(result.Message)
 	}
