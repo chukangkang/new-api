@@ -419,7 +419,7 @@ func ValidateThinkingSignatures(body []byte) error {
 // 的签名（如把外层 field1 的 tag 0x08 改成 0x04 变成 field0），而真签名与
 // 高仿签名都满足该骨架。strict 为 false（redacted_thinking）时仅做基础校验。
 func checkThinkingSignatureFormat(sig string, strict bool) error {
-	const badBase64 = "Invalid `signature` in `thinking` block: signature is not valid base64"
+	const badBase64 = "Invalid `signature` in `thinking` block"
 	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
 	const malformed = "Invalid `signature` in `thinking` block: signature is malformed"
 

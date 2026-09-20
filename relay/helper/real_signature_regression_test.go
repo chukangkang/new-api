@@ -12,7 +12,7 @@ import (
 // TestRealProbeSignatures_SkeletonValidation 用探针脚本里的三个真实签名
 // 离线验证方案 B 的骨架校验判定：
 //   - SIGNATURE  (正确)      -> 通过
-//   - SIGNATURE1 (前导加 C)  -> not valid base64
+//   - SIGNATURE1 (前导加 C)  -> Invalid `signature`（base64 非法）
 //   - SIGNATURE2 (首字节 C->B)-> malformed
 func TestRealProbeSignatures_SkeletonValidation(t *testing.T) {
 	data, err := os.ReadFile("../../test_claude5_mode_probe.sh")
@@ -35,7 +35,7 @@ func TestRealProbeSignatures_SkeletonValidation(t *testing.T) {
 	// SIGNATURE1：前导加 C，长度 mod4!=0 -> 非法 base64
 	err = checkThinkingSignatureFormat(sigs["SIGNATURE1"], true)
 	require.Error(t, err)
-	require.True(t, strings.Contains(err.Error(), "not valid base64"), "got: %v", err)
+	require.True(t, strings.Contains(err.Error(), "Invalid `signature` in `thinking` block"), "got: %v", err)
 
 	// SIGNATURE2：首字节 0x08->0x04，base64 合法但骨架 malformed
 	err = checkThinkingSignatureFormat(sigs["SIGNATURE2"], true)

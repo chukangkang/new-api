@@ -972,7 +972,7 @@ func TestValidateThinkingSignatures_NonBase64Rejected(t *testing.T) {
 	err := ValidateThinkingSignatures([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "messages.0.content.0")
-	require.Contains(t, err.Error(), "not valid base64")
+	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
 }
 
 func TestValidateThinkingSignatures_TooShortRejected(t *testing.T) {
@@ -1008,7 +1008,7 @@ func TestValidateThinkingSignatures_RedactedThinkingCovered(t *testing.T) {
 	]}`
 	err := ValidateThinkingSignatures([]byte(body))
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "not valid base64")
+	require.Contains(t, err.Error(), "Invalid `signature` in `thinking` block")
 }
 
 func TestValidateThinkingSignatures_UserMessagesIgnored(t *testing.T) {

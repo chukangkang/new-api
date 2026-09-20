@@ -187,7 +187,7 @@
   - `signature` 缺失 / 非字符串 / 空串 → **放行**（交给既有的"缺签名预过滤 + 400 整流"链路，避免双重拦截）
   - `signature` 非空 → 必须满足：
     1. 是合法 base64（StdEncoding，失败再试 URLEncoding）
-       否则：`Invalid \`signature\` in \`thinking\` block: signature is not valid base64`
+       否则：`Invalid \`signature\` in \`thinking\` block`
     2. 解码后 ≥ **32 字节**
        否则：`Invalid \`signature\` in \`thinking\` block: signature is too short`
   - 外层包装：`messages.<i>.content.<j>: <上述文案>`
@@ -302,7 +302,7 @@ thinkingSignatureMinDecodedLen = 32
 用法：`bash test_claude5_mode_probe.sh <BASE> <KEY> [MODEL] [REPS]`，依赖 curl + jq。
 对 new-api 改完后，把 BASE 指向 new-api 实例跑一遍，12/12 全绿即对齐完成。
 另加一组签名用例：把请求体里 assistant thinking 块的 signature 改成 `!!!not-base64!!!`
-应得 400 `Invalid \`signature\` in \`thinking\` block: signature is not valid base64`。
+应得 400 `Invalid \`signature\` in \`thinking\` block`。
 
 **max_output 三枪**（R36 专用，2026-09-17 已在生产节点实测全绿）：
 
