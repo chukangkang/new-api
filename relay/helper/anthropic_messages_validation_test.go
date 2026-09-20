@@ -7,6 +7,7 @@ package helper
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -902,20 +903,7 @@ func sigLenDelim(field int, payload []byte) []byte {
 //
 // 返回其 base64 字符串。该骨架与真实签名外层结构一致，可通过严格骨架校验。
 func buildValidSigSkeleton() string {
-	var inner []byte
-	inner = append(inner, sigLenDelim(1, make([]byte, 166))...)
-	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
-	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
-	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
-	inner = append(inner, sigLenDelim(5, make([]byte, 64))...)
-
-	var outer []byte
-	outer = append(outer, sigTag(1, 0))
-	outer = append(outer, sigVarint(2)...) // 版本标记
-	outer = append(outer, sigLenDelim(2, inner)...)
-	outer = append(outer, sigTag(3, 0))
-	outer = append(outer, sigVarint(1)...)
-	return base64.StdEncoding.EncodeToString(outer)
+	return base64.StdEncoding.EncodeToString(validSigBytes())
 }
 
 // tamperedFirstByteSig 返回首字节被篡改（0x08 -> 0x04，外层 field1 退化为
@@ -932,6 +920,78 @@ func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
 		{"role": "user", "content": "hi"}
 	]}`, buildValidSigSkeleton())
 	require.NoError(t, ValidateThinkingSignatures([]byte(body)))
+}
+
+// TestDecodeSignatureBase64_EncodingVariants 回归：同一份正确签名在不同
+// base64 编码风格下（标准/URL-safe/无 padding/夹带空白）都必须能通过解码，
+// 否则会误杀真实上游产出的合法签名。
+func TestDecodeSignatureBase64_EncodingVariants(t *testing.T) {
+	std := base64.StdEncoding.EncodeToString(validSigBytes())
+	url := base64.URLEncoding.EncodeToString(validSigBytes())
+	rawStd := base64.RawStdEncoding.EncodeToString(validSigBytes())
+	rawUrl := base64.RawURLEncoding.EncodeToString(validSigBytes())
+
+	// 夹带换行/空格的折行长签名（每 76 字符插一个换行）。
+	wrapped := wrapBase64(std, 76)
+
+	for name, s := range map[string]string{
+		"std":      std,
+		"url":      url,
+		"rawStd":   rawStd,
+		"rawUrl":   rawUrl,
+		"wrapped":  wrapped,
+		"whitespace": "  " + std[:10] + "\n" + std[10:] + " ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, ok := decodeSignatureBase64(s)
+			require.True(t, ok, "should decode %s", name)
+			require.Equal(t, validSigBytes(), b)
+		})
+	}
+}
+
+// TestDecodeSignatureBase64_GarbageRejected 确认乱码仍被拒绝（不误放）。
+// 注："" 与 "abc" 能被 raw 编码解出（空/2 字节），交由后续 too-short 拦截，
+// 不属于解码失败，故此处只挑真正无法解码的输入。
+func TestDecodeSignatureBase64_GarbageRejected(t *testing.T) {
+	for _, s := range []string{"!!!not-base64$$$", "a", "+/="} {
+		_, ok := decodeSignatureBase64(s)
+		require.False(t, ok, "should reject %q", s)
+	}
+}
+
+// validSigBytes 返回一份符合官方骨架的签名原始字节（供多种编码复用）。
+func validSigBytes() []byte {
+	var inner []byte
+	inner = append(inner, sigLenDelim(1, make([]byte, 166))...)
+	inner = append(inner, sigLenDelim(2, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(3, make([]byte, 12))...)
+	inner = append(inner, sigLenDelim(4, make([]byte, 48))...)
+	inner = append(inner, sigLenDelim(5, make([]byte, 64))...)
+
+	var outer []byte
+	outer = append(outer, sigTag(1, 0))
+	outer = append(outer, sigVarint(2)...)
+	outer = append(outer, sigLenDelim(2, inner)...)
+	outer = append(outer, sigTag(3, 0))
+	outer = append(outer, sigVarint(1)...)
+	return outer
+}
+
+// wrapBase64 每 width 个字符插入一个换行，模拟被折行的长签名。
+func wrapBase64(s string, width int) string {
+	var sb strings.Builder
+	for i := 0; i < len(s); i += width {
+		end := i + width
+		if end > len(s) {
+			end = len(s)
+		}
+		sb.WriteString(s[i:end])
+		if end < len(s) {
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
 }
 
 func TestValidateThinkingSignatures_TamperedFirstByteRejected(t *testing.T) {

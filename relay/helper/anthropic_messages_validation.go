@@ -423,14 +423,9 @@ func checkThinkingSignatureFormat(sig string, strict bool) error {
 	const tooShort = "Invalid `signature` in `thinking` block: signature is too short"
 	const malformed = "Invalid `signature` in `thinking` block: signature is malformed"
 
-	decoded, err := base64.StdEncoding.DecodeString(sig)
-	if err != nil {
-		// 兼容 URL-safe base64（个别客户端/上游可能使用）
-		if decoded2, err2 := base64.URLEncoding.DecodeString(sig); err2 == nil {
-			decoded = decoded2
-		} else {
-			return errors.New(badBase64)
-		}
+	decoded, ok := decodeSignatureBase64(sig)
+	if !ok {
+		return errors.New(badBase64)
 	}
 	if len(decoded) < thinkingSignatureMinDecodedLen {
 		return errors.New(tooShort)
@@ -439,6 +434,43 @@ func checkThinkingSignatureFormat(sig string, strict bool) error {
 		return errors.New(malformed)
 	}
 	return nil
+}
+
+// decodeSignatureBase64 宽容地解码 thinking 签名。
+//
+// 不同上游/客户端产出的签名在 base64 细节上并不统一：有的带 padding、
+// 有的剥掉 padding（raw），有的用 URL-safe 字母表（-_ 代替 +/），极少数
+// 会在长签名里夹带换行/空格。为避免误杀"结构正确但编码风格不同"的真签名
+// （本文件设计原则：宁可漏拦不可误杀），这里依次尝试四种编码，并对输入
+// 做一次空白剔除后再试一轮。任一成功即返回解码结果。
+func decodeSignatureBase64(sig string) ([]byte, bool) {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.RawURLEncoding,
+	}
+	for _, enc := range encodings {
+		if b, err := enc.DecodeString(sig); err == nil {
+			return b, true
+		}
+	}
+	// 兜底：剔除空白（换行/空格/tab）后再试，应对被折行的长签名。
+	stripped := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, sig)
+	if stripped != sig {
+		for _, enc := range encodings {
+			if b, err := enc.DecodeString(stripped); err == nil {
+				return b, true
+			}
+		}
+	}
+	return nil, false
 }
 
 // isValidThinkingSignatureSkeleton 校验解码后的签名是否符合官方 thinking
