@@ -17,6 +17,7 @@ package helper
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -89,11 +91,14 @@ func ValidateClaudeMessagesRequest(c *gin.Context) error {
 	if verr := ValidateAnthropicRequest(body, requireMaxTokens, c.GetHeader("anthropic-beta")); verr != nil {
 		return WrapAnthropicValidationError(verr)
 	}
-	// thinking 块签名结构校验（可配置，默认开）：上游多数链路不验签，
+	// thinking 块签名校验（可配置，默认开）：上游多数链路不验签，
 	// 网关自守门，客户端传了格式坏的签名（非 base64/过短）直接 400。
-	// 仅 /v1/messages 生效；count_tokens 端点不做此项。
+	// 开启 ThinkingSignatureRegistry 后追加发放注册表成员校验（只认
+	// 本网关近期从上游响应里见过的签名）。仅 /v1/messages 生效；
+	// count_tokens 端点不做此项。
 	if !isCountTokens && setting.ShouldValidateThinkingSignatures() {
-		if serr := ValidateThinkingSignatures(body); serr != nil {
+		userId := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+		if serr := ValidateThinkingSignaturesFull(body, userId); serr != nil {
 			return WrapAnthropicValidationError(serr)
 		}
 	}
@@ -383,16 +388,34 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 //   - signature 存在且非空：必须是合法 base64，且解码后不少于
 //     thinkingSignatureMinDecodedLen 字节，否则返回 400 风格错误。
 //
-// 该检查是纯结构性的（骨架 + 深度指纹，见 checkThinkingSignatureFormat）：
-// 能识别"格式坏了"的签名（空/截断/乱码/非 base64）、结构损坏、元数据缺失
-// （thinking 标识/UUID/模型名）以及跨模型重放；但无法识别密文主体内部的
-// 逐字节篡改（网关没有 Anthropic 密钥，做不了密码学验签）。因此对"上游每轮
-// 签发新签名"这一正常情形天然免疫——只要新签名结构合法且模型名一致就会放行。
+// 该检查分两层：
+//  1. 结构性（骨架 + 深度指纹，见 checkThinkingSignatureFormat）：
+//     能识别"格式坏了"的签名（空/截断/乱码/非 base64）、结构损坏、元数据
+//     缺失（thinking 标识/UUID/模型名）以及跨模型重放；
+//  2. 发放注册表（可选，setting.ShouldVerifyThinkingSignatureRegistry）：
+//     要求签名确实出现在该用户近期收到的上游响应中（见
+//     anthropic_signature_registry.go）。这是对第一层的补充——签名是
+//     密钥化 MAC，网关无私钥做不了真正的密码学验签，也无法识别密文主体
+//     内部的逐字节篡改；注册表通过"只认自己见过的签名"把单字符篡改、
+//     跨用户重放一并拦下。注册表为空时 fail-open（冷启动宽限）。
+//
+// 对"上游每轮签发新签名"这一正常情形天然免疫：新签名在上一轮响应里就被
+// 登记过了，本轮回传时注册表命中。
 //
 // 作用域：仅 /v1/messages，count_tokens 不做。
+//
+// ValidateThinkingSignatures 是仅结构校验的便捷入口（userId 传 0，
+// 注册表成员检查不生效），供不需要注册表上下文的调用方与既有测试使用。
 func ValidateThinkingSignatures(body []byte) error {
+	return ValidateThinkingSignaturesFull(body, 0)
+}
+
+// ValidateThinkingSignaturesFull 在结构校验之上叠加发放注册表成员校验
+// （受 setting.ShouldVerifyThinkingSignatureRegistry 控制）。
+func ValidateThinkingSignaturesFull(body []byte, userId int) error {
 	// 模型名取自请求体顶层（跨模型重放校验用）；缺失时留空，深度校验跳过该项。
 	modelName := gjson.GetBytes(body, "model").Str
+	registryOn := setting.ShouldVerifyThinkingSignatureRegistry()
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
 		return nil
@@ -419,6 +442,20 @@ func ValidateThinkingSignatures(body []byte) error {
 			strict := btype == "thinking"
 			if err := checkThinkingSignatureFormat(sig.Str, strict, modelName); err != nil {
 				return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, err)
+			}
+			// 注册表成员校验：签名必须曾被上游对该 (用户,模型) 签发过。
+			// thinking 块按「签名↔文本」配对指纹查找（与登记侧同公式），
+			// 换绑文本同样未命中；redacted_thinking 无文本，查裸签名。
+			// 注册表为空/后端不可用时 fail-open，退回纯结构校验。
+			if registryOn {
+				lookup := sig.Str
+				if strict {
+					lookup = SignaturePairFingerprint(sig.Str, block.Get("thinking").Str)
+				}
+				hit, available := HasRegisteredSignature(context.Background(), userId, modelName, lookup)
+				if available && !hit {
+					return fmt.Errorf("messages.%d.content.%d: %v", mi, bi, errors.New("Invalid `signature` in `thinking` block: signature not recognized"))
+				}
 			}
 		}
 	}
@@ -462,17 +499,19 @@ func checkThinkingSignatureFormat(sig string, strict bool, modelName string) err
 // isValidThinkingSignatureSkeleton 校验解码后的签名是否符合官方 thinking
 // 签名的 protobuf 骨架：
 //
-//	outer: field1 varint（版本标记） + field2 bytes（内层，须良构） [+ 尾随字段]
+//	outer: [field1 varint（版本标记，可有可无）] + field2 bytes（内层，须良构） [+ 尾随字段]
 //
 // 判定要点：
 //   - 整个外层必须是良构 protobuf（能被完整消费，无越界/坏 tag）；
-//   - 必须出现 field1 且为 varint（wire 0）——这是版本标记，真签名恒为 2；
 //   - 必须出现 field2 且为 len-delimited（wire 2），其内容本身也须良构。
 //
-// 任一不满足即视为 malformed。该校验刻意宽松于"逐字段比对"，只锁定官方
-// 签名稳定不变的外层骨架，从而既拦下首字节篡改，又不误伤合法签名。
+// 注意：外层 field1 版本标记**不是**必需项——实测不同模型/时期的真签名
+// 有的带（fable-5，值为 2）、有的不带（sonnet-5、早期 opus-4-8 样本，
+// 外层直接从 field2 起）。曾要求必有 field1 导致 sonnet-5 真签名被误杀
+// （2026-09-21 线上实测发现）。首字节篡改依然可拦：tag 字节损坏会使
+// 外层解析失败或 field2 丢失。该校验刻意宽松于"逐字段比对"，只锁定
+// 官方签名稳定不变的外层骨架，从而不误伤合法签名。
 func isValidThinkingSignatureSkeleton(b []byte) bool {
-	hasVersion := false
 	hasInner := false
 	i := 0
 	for i < len(b) {
@@ -491,9 +530,6 @@ func isValidThinkingSignatureSkeleton(b []byte) bool {
 				return false
 			}
 			i += n
-			if field == 1 {
-				hasVersion = true
-			}
 		case 1: // fixed64
 			if i+8 > len(b) {
 				return false
@@ -521,7 +557,7 @@ func isValidThinkingSignatureSkeleton(b []byte) bool {
 			return false
 		}
 	}
-	return hasVersion && hasInner
+	return hasInner
 }
 
 // protoWellFormed 判断 b 是否为良构 protobuf（能被从头到尾完整消费）。

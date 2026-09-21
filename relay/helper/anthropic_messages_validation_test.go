@@ -1046,9 +1046,11 @@ func TestValidateThinkingSignatures_TamperedFirstByteRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "malformed")
 }
 
-func TestValidateThinkingSignatures_MissingVersionFieldRejected(t *testing.T) {
-	// 外层缺少 field1（版本标记）：仅有 field2 内层，骨架不完整。
-	// 内层放大到足以越过 32 字节长度阈值，确保走到骨架校验而非 too short。
+func TestValidateThinkingSignatures_MissingVersionFieldStillMalformed(t *testing.T) {
+	// 外层缺少 field1（版本标记）：仅有 field2 内层。
+	// 2026-09-21 起骨架校验不再要求 field1（sonnet-5/早期 opus-4-8 真签名
+	// 本就无此字段），但该合成签名的内层元数据不含 "thinking"/UUID/模型名，
+	// 仍会被深度指纹判为 malformed——回归锚点是"整体仍被拒"。
 	var inner []byte
 	inner = append(inner, sigLenDelim(1, make([]byte, 64))...)
 	var outer []byte

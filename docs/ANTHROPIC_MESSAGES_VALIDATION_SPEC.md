@@ -31,6 +31,10 @@
 | `3a1038097` | 09-17 | 404 模型不可用的线上错误类型统一为官方 `not_found_error`（见 §2.7） |
 | `296f3b3cb` | 09-17 | max_tokens 上限表扩至官方全部有公开规格的模型（见 R36）；新增 13 模型 × 双向断言回归 |
 | `4db39d2c5` | 09-18 | R10 位置敏感：`messages[0].role=system` → 400，中间位置 → 200（对齐真实 API）；count_tokens 渠道路径归一（`/v1/messages/count_tokens` 匹配时剥离后缀，复用 Claude Messages 渠道） |
+| `b0f2e38e5` | 09-20 | thinking 签名**深度指纹校验**：内层元数据须含 "thinking" 标识 + UUID + 模型名一致（拦跨模型重放）；外层骨架须良构且含版本标记 |
+| （2026-09-21） | 09-21 | thinking 签名**发放注册表**（§2.5b）：上游响应签名登记 + 请求侧成员校验，拦单字符篡改/跨用户重放；密码学解剖确认签名是密钥化 MAC，无密钥不可真验签 |
+| （2026-09-21） | 09-21 | 注册表升级为**签名↔thinking 文本配对绑定**（§2.5b）：thinking 块按 `sha256(sig‖"\x00"‖thinking)` 记账，拦"真签名配篡改文本"的换绑攻击；redacted_thinking 无文本仍按裸签名 |
+| （2026-09-21） | 09-21 | **骨架校验收窄**：外层 field1 版本标记改为**非必需**（§2.5）。线上实测 sonnet-5/早期 opus-4-8 真签名外层无 field1（直接从 field2 起），旧逻辑把它们误判 malformed；现只要求外层良构 + field2 内层良构，首字节篡改仍可拦 |
 
 合计（`git diff v1.0.0-rc.24..HEAD`，截至 `4db39d2c5`）：16 文件，+2654 / -15。
 
@@ -196,6 +200,46 @@
   - 对"上游每轮签发新签名"天然免疫（不比历史值，只看格式）；
   - 背景事实：windf.new-api.ai 与 new-api.ai 两条 Opus 5 链路实测**都不校验签名内容**，坏签名照收 200。
 - 配置开关：settings 键 `thinking_signature_validation`，**默认开**（缺失/查询出错均按开处理，fail-open 到"校验开"），仅显式 `"false"` 关闭。
+
+### 2.5b thinking 签名发放注册表（2026-09-21，可配置，默认关）
+
+§2.5 的结构+深度指纹校验对"密文主体内部单字符篡改"无效（C2 用例长期 200 的原因）。
+密码学解剖（`_tmp_sigdump/cryptcheck`，2026-09-21 三份真实样本实测）确认：签名是
+**密钥化 MAC**——穷举 SHA-256/384/512（含截断、多种字段拼接）均无明文哈希承诺；
+内层 field2/field3 是签发时间戳（LE64≈unix 秒）；空 thinking 也有独立签名
+（含 nonce）。**无 Anthropic 私钥不可能做真正的密码学验签。**
+
+注册表用"只认自己见过的签名"补齐这一环：
+
+- **登记侧**（`relay/channel/claude/relay-claude.go::registerClaudeSignatures`）：
+  上游 200 响应中出现 thinking/redacted_thinking 签名即登记。收割来源：
+  非流式 `Content[]` 块；流式 `signature_delta` 事件（`Delta` 携带完整签名）；
+  兜底 `content_block_start` 的 `ContentBlock`。键 = `(UserId, 请求体 model)`，
+  注意必须用客户端视角模型名（`OriginModelName`），与请求侧校验口径一致。
+- **配对绑定**：Anthropic 的签名覆盖 thinking 内容本身，因此注册表对
+  thinking 块不按裸签名而是按**配对指纹**记账：
+  `SignaturePairFingerprint(sig, thinking) = hex(sha256(sig ‖ "\x00" ‖ thinking))`
+  （`relay/helper/anthropic_signature_registry.go`）。流式场景 thinking 文本散在
+  多个 `thinking_delta` 事件里，按块索引用 gin context 累积器
+  （`appendStreamThinking`/`accumulateStreamThinking`）拼到 `signature_delta`
+  到达时再算指纹。`redacted_thinking` 无可见文本，仍按裸签名记账。
+- **校验侧**（`ValidateThinkingSignaturesFull`）：结构校验通过后，若开关开启，
+  要求签名命中注册表，否则 400 `Invalid \`signature\` in \`thinking\` block:
+  signature not recognized`。thinking 块同样按配对指纹查询——拿到真签名
+  但换了 thinking 文本（换绑攻击）也会因指纹不匹配而被拒。
+- **冷启动宽限**：全局"热标记"（网关从未登记过任何签名）期间 fail-open，
+  只做结构校验；首次登记后进入热态，此后一切未命中（含其他用户/模型的空桶）
+  都是拒绝——堵住跨用户重放。
+- **存储**：优先 Redis（`anthropic:sigreg:<uid>:<model>` hash + 24h TTL +
+  `anthropic:sigreg:warm` 热标记）；未启用 Redis 降级进程内 map（桶上限
+  4096、每桶签名上限 512）。存储异常只记日志，不影响转发。
+- 配置开关：settings 键 `ThinkingSignatureRegistry`，**默认关**（仅显式
+  `"true"` 开启）——它是增强校验，开启前需确认客户端签名均来自本网关转发的
+  上游响应。
+- 拦截能力对比：结构校验拦"格式坏/元数据不符/跨模型重放"；注册表在其上
+  追加拦"单字符篡改、跨用户重放、凭空捏造"；配对绑定再追加拦"真签名配篡改
+  文本"。三者叠加即为网关侧完整验签闭环。残余理论缺口：能实时观察到用户
+  上游响应的攻击者可回放真实的 (签名, 文本) 对——等价于合法持有该会话。
 
 ### 2.6 错误响应格式对齐（1c6a2a8d5）
 
