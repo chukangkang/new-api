@@ -7,9 +7,12 @@ package helper
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -254,6 +257,7 @@ var samplingParamModels = []struct {
 	{"opus-4-7", "claude-opus-4-7"},
 	{"opus-4-8", "claude-opus-4-8"},
 	{"opus-5", "claude-opus-5"},
+	{"opus-5-5", "claude-opus-5-5"},
 	{"sonnet-5", "claude-sonnet-5"},
 	{"fable-5", "claude-fable-5"},
 	{"fable-5-1", "claude-fable-5-1"},
@@ -517,6 +521,121 @@ func TestValidateAnthropicRequest_DisabledWithHighEffort_Opus48Accepted(t *testi
 		body := fmt.Sprintf(`{"model": "claude-opus-4-8", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "%s"}}`, effort)
 		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""), "opus-4-8 disabled+%s should be accepted", effort)
 	}
+}
+
+func TestValidateAnthropicRequest_DisabledWithHighEffort_R34OnlyOpus5(t *testing.T) {
+	// R34 收窄（2026-09-26）：disabled + effort∈{xhigh,max} 的 400 仅限
+	// claude-opus-5（官方《思考功能故障排查》模型表脚注②只挂在 Opus 5 行；
+	// 测试台实测 sonnet-5 的 disabled+xhigh 返回 200）。
+	// 8 模型 × 2 effort：断言 R34 组合文案不出现在任何其他模型上。
+	const r34Msg = `"thinking.type" value "disabled" is not supported with "output_config.effort"`
+	type outcome int
+	const (
+		ok            outcome = iota // 应放行
+		thinkingDisabledRejected     // 被 thinking.type 矩阵拒绝（fable/mythos 5.x）
+		effortLevelRejected          // 被 effort 分级表拒绝（R33，如 opus-4-6 无 xhigh）
+	)
+	cases := []struct {
+		model  string
+		outcome map[string]outcome // effort → 期望
+	}{
+		{"claude-sonnet-5", map[string]outcome{"xhigh": ok, "max": ok}},
+		{"claude-opus-4-8", map[string]outcome{"xhigh": ok, "max": ok}},
+		{"claude-opus-4-7", map[string]outcome{"xhigh": ok, "max": ok}},
+		{"claude-opus-4-6", map[string]outcome{"xhigh": effortLevelRejected, "max": ok}},
+		{"claude-fable-5", map[string]outcome{"xhigh": thinkingDisabledRejected, "max": thinkingDisabledRejected}},
+		{"claude-fable-5-1", map[string]outcome{"xhigh": thinkingDisabledRejected, "max": thinkingDisabledRejected}},
+		{"claude-mythos-5", map[string]outcome{"xhigh": thinkingDisabledRejected, "max": thinkingDisabledRejected}},
+		{"claude-mythos-5-1", map[string]outcome{"xhigh": thinkingDisabledRejected, "max": thinkingDisabledRejected}},
+	}
+	for _, tc := range cases {
+		for _, effort := range []string{"xhigh", "max"} {
+			t.Run(tc.model+"_"+effort, func(t *testing.T) {
+				body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "%s"}}`, tc.model, effort)
+				err := ValidateAnthropicRequest([]byte(body), true, "")
+				switch tc.outcome[effort] {
+				case ok:
+					require.NoError(t, err, "%s disabled+%s should be accepted", tc.model, effort)
+				case thinkingDisabledRejected:
+					require.Error(t, err)
+					require.Contains(t, err.Error(), `"thinking.type.disabled" is not supported`)
+				case effortLevelRejected:
+					require.Error(t, err)
+					require.Contains(t, err.Error(), `"output_config.effort" value "`+effort+`" is not supported`)
+				}
+				if err != nil {
+					require.NotContains(t, err.Error(), r34Msg,
+						"%s disabled+%s must not hit the R34 combo rule", tc.model, effort)
+				}
+			})
+		}
+	}
+}
+
+func TestValidateAnthropicRequest_Opus55Matrix(t *testing.T) {
+	// claude-opus-5-5 全矩阵（官方 2026-09-25 文档快照）：
+	// thinking.type 仅 adaptive；max_tokens 上限 128000；拒绝非默认采样参数；
+	// 拒绝 forced tool_choice；拒绝 assistant prefill。
+	const model = "claude-opus-5-5"
+
+	t.Run("adaptive_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("enabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+	})
+	t.Run("disabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+	})
+	t.Run("max_tokens_128000_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128000, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("max_tokens_128001_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+	})
+	t.Run("temperature_non_default_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"temperature" must be 1.0 for this model`, err.Error())
+	})
+	t.Run("top_p_low_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_p": 0.9}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_p" must be >= 0.99 for this model`, err.Error())
+	})
+	t.Run("top_k_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_k": 40}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_k" is not supported for this model`, err.Error())
+	})
+	t.Run("forced_tool_choice_rejected", func(t *testing.T) {
+		for _, tcType := range []string{"tool", "any"} {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "t", "input_schema": {"type": "object"}}], "tool_choice": {"type": "%s"}}`, model, tcType)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `tool_choice: type "tool" and "any" are not supported for this model.`, err.Error())
+		}
+	})
+	t.Run("prefill_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "partial answer"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `This model does not support assistant message prefill. The conversation must end with a user message.`, err.Error())
+	})
 }
 
 func TestValidateAnthropicRequest_Thinking_Opus48_Sonnet5(t *testing.T) {
@@ -953,6 +1072,214 @@ func TestValidateThinkingSignatures_ValidSignatureAccepted(t *testing.T) {
 		{"role": "user", "content": "hi"}
 	]}`, buildValidSigSkeleton())
 	require.NoError(t, ValidateThinkingSignatures([]byte(body)))
+}
+
+// ── image 块校验（§2.9）──
+
+// imageBody 把给定 content 数组元素包成一个合法请求体。
+func imageBody(contentElements ...string) string {
+	return fmt.Sprintf(`{"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": [{"role": "user", "content": [%s]}]}`,
+		strings.Join(contentElements, ","))
+}
+
+// pngDimsB64 构造指定宽高的最小 PNG 头（magic+IHDR）的 base64。
+func pngDimsB64(w, h int) string {
+	b := make([]byte, 24)
+	copy(b, []byte{'\x89', 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	copy(b[8:], "IHDR")
+	binary.BigEndian.PutUint32(b[16:], uint32(w))
+	binary.BigEndian.PutUint32(b[20:], uint32(h))
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// jpegDimsB64 构造指定宽高的最小 JPEG SOF0 头的 base64。
+func jpegDimsB64(w, h int) string {
+	b := make([]byte, 12)
+	b[0], b[1], b[2], b[3] = 0xFF, 0xD8, 0xFF, 0xC0
+	b[4], b[5] = 0x00, 0x11 // segment length
+	b[6] = 0x08             // precision
+	binary.BigEndian.PutUint16(b[7:], uint16(h))
+	binary.BigEndian.PutUint16(b[9:], uint16(w))
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// gifDimsB64 构造指定宽高的最小 GIF 头的 base64。
+func gifDimsB64(w, h int) string {
+	b := make([]byte, 10)
+	copy(b, "GIF89a")
+	binary.LittleEndian.PutUint16(b[6:], uint16(w))
+	binary.LittleEndian.PutUint16(b[8:], uint16(h))
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// webpDimsB64 构造指定宽高的最小 WebP(VP8L) 头的 base64。
+func webpDimsB64(w, h int) string {
+	b := make([]byte, 22)
+	copy(b, "RIFF")
+	binary.LittleEndian.PutUint32(b[4:], 22)
+	copy(b[8:], "WEBP")
+	copy(b[12:], "VP8L")
+	b[16] = 0x2f
+	binary.LittleEndian.PutUint16(b[17:], uint16(w-1))
+	binary.LittleEndian.PutUint16(b[19:], uint16(h-1))
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func base64ImageElem(mediaType, data string) string {
+	return fmt.Sprintf(`{"type": "image", "source": {"type": "base64", "media_type": %q, "data": %q}}`, mediaType, data)
+}
+
+func TestValidateAnthropicRequest_ImageValidSources(t *testing.T) {
+	// base64（四种格式各一）
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", pngDimsB64(100, 100)))), true, ""))
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/jpeg", jpegDimsB64(100, 100)))), true, ""))
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/gif", gifDimsB64(100, 100)))), true, ""))
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/webp", webpDimsB64(100, 100)))), true, ""))
+	// url
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(
+		`{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}`)), true, ""))
+	// file
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(
+		`{"type": "image", "source": {"type": "file", "file_id": "file_abc123"}}`)), true, ""))
+}
+
+func TestValidateAnthropicRequest_ImageMediaTypeRejected(t *testing.T) {
+	err := ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/bmp", pngDimsB64(10, 10)))), true, "")
+	require.Error(t, err)
+	// 官方逐字文案（pydantic Literal 风格）
+	assert.Equal(t,
+		"messages.0.content.0.source.base64.media_type: Input should be 'image/jpeg', 'image/png', 'image/gif' or 'image/webp'",
+		err.Error())
+}
+
+func TestValidateAnthropicRequest_ImageSourceStructure(t *testing.T) {
+	cases := []struct {
+		name string
+		elem string
+		want string
+	}{
+		{"missing_source", `{"type": "image"}`, "messages.0.content.0.source: Field required"},
+		{"missing_source_type", `{"type": "image", "source": {"media_type": "image/png", "data": "AA=="}}`, "messages.0.content.0.source.type: Field required"},
+		{"bad_source_type", `{"type": "image", "source": {"type": "remote", "url": "https://x"}}`, "messages.0.content.0.source.type: Input should be 'base64', 'url' or 'file'"},
+		{"missing_media_type", `{"type": "image", "source": {"type": "base64", "data": "AA=="}}`, "messages.0.content.0.source.base64.media_type: Field required"},
+		{"missing_data", `{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}`, "messages.0.content.0.source.base64.data: Field required"},
+		{"missing_url", `{"type": "image", "source": {"type": "url"}}`, "messages.0.content.0.source.url.url: Field required"},
+		{"empty_url", `{"type": "image", "source": {"type": "url", "url": ""}}`, "messages.0.content.0.source.url.url: Field required"},
+		{"missing_file_id", `{"type": "image", "source": {"type": "file"}}`, "messages.0.content.0.source.file.file_id: Field required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateAnthropicRequest([]byte(imageBody(tc.elem)), true, "")
+			require.Error(t, err)
+			assert.Equal(t, tc.want, err.Error())
+		})
+	}
+}
+
+func TestValidateAnthropicRequest_ImageSizeLimit(t *testing.T) {
+	// 解码后约 10485762 字节 > 10 MiB
+	big := strings.Repeat("AAAA", 3495254)
+	err := ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", big))), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Image exceeds the maximum size of 10MB")
+	// 恰好 10 MiB（10485760 字节 = 13421772 个 base64 字符）应通过
+	ok := strings.Repeat("AAAA", 3495253) + "AA=="
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", ok))), true, ""))
+}
+
+func TestValidateAnthropicRequest_ImageCountLimit(t *testing.T) {
+	elems := make([]string, 0, 601)
+	for i := 0; i < 601; i++ {
+		elems = append(elems, `{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}`)
+	}
+	err := ValidateAnthropicRequest([]byte(imageBody(elems...)), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Too many images in request: maximum 600 images allowed, got 601")
+	// 恰好 600 张通过
+	elems = elems[:600]
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(elems...)), true, ""))
+}
+
+func TestValidateAnthropicRequest_ImagePixelLimits(t *testing.T) {
+	// 单边超 8000 → 拒
+	err := ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", pngDimsB64(8001, 100)))), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceed the maximum of 8000px")
+	// 恰好 8000×8000 → 过
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", pngDimsB64(8000, 8000)))), true, ""))
+	// 高度超限同样拦截
+	err = ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/jpeg", jpegDimsB64(100, 9000)))), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceed the maximum of 8000px")
+}
+
+func TestValidateAnthropicRequest_ImageManyImageStrictLimit(t *testing.T) {
+	// 21 张（>20）且单张 3000px（>2000）→ many-image 文案
+	elems := make([]string, 0, 21)
+	for i := 0; i < 21; i++ {
+		elems = append(elems, base64ImageElem("image/png", pngDimsB64(3000, 3000)))
+	}
+	err := ValidateAnthropicRequest([]byte(imageBody(elems...)), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceed the 2000px limit for many-image requests")
+
+	// 恰好 20 张 3000px → 仍按 8000 上限，通过
+	elems = elems[:20]
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(elems...)), true, ""))
+
+	// 21 张但都在 2000px 以内 → 通过
+	small := make([]string, 0, 21)
+	for i := 0; i < 21; i++ {
+		small = append(small, base64ImageElem("image/png", pngDimsB64(2000, 2000)))
+	}
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(small...)), true, ""))
+}
+
+func TestValidateAnthropicRequest_ImageNestedInToolResultCounts(t *testing.T) {
+	// 20 张顶层 + 1 张 tool_result 内嵌 = 21 张 → 触发 many 模式
+	top := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		top = append(top, base64ImageElem("image/png", pngDimsB64(3000, 3000)))
+	}
+	tr := `{"type": "tool_result", "tool_use_id": "tu_1", "content": [` +
+		base64ImageElem("image/png", pngDimsB64(3000, 3000)) + `]}`
+	err := ValidateAnthropicRequest([]byte(imageBody(append(top, tr)...)), true, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "many-image requests")
+}
+
+func TestValidateAnthropicRequest_ImageUnparseableHeaderFailOpen(t *testing.T) {
+	// 合法 base64 但不是已知图片格式 → 像素检查放行
+	junk := base64.StdEncoding.EncodeToString(make([]byte, 64))
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", junk))), true, ""))
+	// 非法 base64 → 尺寸与大小估算均放行
+	require.NoError(t, ValidateAnthropicRequest([]byte(imageBody(base64ImageElem("image/png", "!!!not-base64!!!"))), true, ""))
+}
+
+func TestDecodeImageDimensions(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		w, h int
+		ok   bool
+	}{
+		{"png", pngDimsB64(1920, 1080), 1920, 1080, true},
+		{"jpeg", jpegDimsB64(3840, 2160), 3840, 2160, true},
+		{"gif", gifDimsB64(640, 480), 640, 480, true},
+		{"webp_vp8l", webpDimsB64(1000, 500), 1000, 500, true},
+		{"garbage", base64.StdEncoding.EncodeToString([]byte("hello world")), 0, 0, false},
+		{"not_base64", "zzz", 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, h, ok := decodeImageDimensions(tc.data)
+			assert.Equal(t, tc.ok, ok)
+			if ok {
+				assert.Equal(t, tc.w, w)
+				assert.Equal(t, tc.h, h)
+			}
+		})
+	}
 }
 
 func TestValidateThinkingSignatures_DeepFingerprintCases(t *testing.T) {

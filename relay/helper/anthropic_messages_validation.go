@@ -204,6 +204,11 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		}
 	}
 
+	// ── image blocks: source 结构 + 媒体类型 + 大小/数量/像素限额（§2.9）──
+	if err := validateAnthropicImages(arr); err != nil {
+		return err
+	}
+
 	// ── temperature: optional, 0.0 <= t <= 1.0 ──
 	// Opus 4.6 之后发布的模型仅接受 1.0（向后兼容），其他值 400
 	if t := gjson.GetBytes(body, "temperature"); t.Exists() {
@@ -354,11 +359,14 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		}
 	}
 
-	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 起不可关思考 ──
-	// 官方：Claude Opus 5 及之后模型在 xhigh/max effort 下无法关闭 thinking，
+	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 不可关思考 ──
+	// 官方：Claude Opus 5 在 xhigh/max effort 下无法关闭 thinking，
 	// 两者组合返回 400。低档 effort（≤high）允许 disabled。
-	// 注意：仅「Opus 5 及之后」（opus-5/sonnet-5/fable-5*/mythos-5*）受此约束；
-	// Opus 4.8 / 4.7 / 4.6 等更早模型 disabled + xhigh 仍可 200（真伪验证实测）。
+	// 注意：仅 claude-opus-5 受此约束（官方《思考功能故障排查》模型表脚注②
+	// 只挂在 Opus 5 行）；sonnet-5 的 disabled+xhigh 实测 200（2026-09-26
+	// 测试台用例 thinking.disabled_xhigh_accepted），fable-5*/mythos-5*
+	// 本就拒绝 disabled（thinking.type 矩阵先行拦截）；Opus 4.8 / 4.7 / 4.6
+	// 等更早模型 disabled + xhigh 仍可 200（真伪验证实测）。
 	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" &&
 		familyRejectsDisabledWithHighEffort(model.Str) {
 		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
@@ -889,7 +897,7 @@ func modelMaxOutputTokens(model string) (int, bool) {
 	switch normalizeThinkingModelFamily(model) {
 	case "claude-fable-5-1", "claude-fable-5",
 		"claude-mythos-5-1", "claude-mythos-5",
-		"claude-opus-5", "claude-sonnet-5",
+		"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5",
 		"claude-opus-4-8", "claude-opus-4-7",
 		"claude-opus-4-6", "claude-sonnet-4-6":
 		return 128000, true
@@ -899,18 +907,13 @@ func modelMaxOutputTokens(model string) (int, bool) {
 	return 0, false
 }
 
-// familyRejectsDisabledWithHighEffort 判断模型是否属于「Opus 5 及之后」，
-// 即在 thinking.type=disabled 搭配 effort=xhigh/max 时应返回 400。
-// 仅 opus-5 / sonnet-5 / fable-5* / mythos-5* 受此约束；更早的
-// opus-4-8 / opus-4-7 / opus-4-6 等 disabled + xhigh 仍可 200（真伪验证实测）。
+// familyRejectsDisabledWithHighEffort 判断模型在 thinking.type=disabled
+// 搭配 effort=xhigh/max 时是否应返回 400。
+// 仅 claude-opus-5 受此约束（2026-09-26 收窄：官方《思考功能故障排查》
+// 模型表脚注②只挂在 Opus 5 行；此前误扩到整个 5 系，但测试台实测
+// sonnet-5 的 disabled+xhigh 返回 200）。其余模型 fail-open。
 func familyRejectsDisabledWithHighEffort(model string) bool {
-	switch normalizeThinkingModelFamily(model) {
-	case "claude-opus-5", "claude-sonnet-5",
-		"claude-fable-5", "claude-fable-5-1",
-		"claude-mythos-5", "claude-mythos-5-1":
-		return true
-	}
-	return false
+	return normalizeThinkingModelFamily(model) == "claude-opus-5"
 }
 
 // modelSupportsFastMode 判断模型是否支持 fast mode（speed=fast）。
@@ -959,7 +962,7 @@ func familySupportsPrefillReject(model string) bool {
 	switch family {
 	case "claude-opus-4-6", "claude-sonnet-4-6",
 		"claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-sonnet-5",
+		"claude-opus-5-5", "claude-sonnet-5",
 		"claude-fable-5", "claude-fable-5-1",
 		"claude-mythos-5", "claude-mythos-5-1":
 		return true
@@ -968,10 +971,10 @@ func familySupportsPrefillReject(model string) bool {
 }
 
 // familyRejectsForcedToolChoice 判断模型是否拒绝 tool_choice 的 "tool"/"any"：
-// Claude Fable 5.1 与 Claude Mythos 5.1。
+// Claude Fable 5.1、Claude Mythos 5.1 与 Claude Opus 5.5。
 func familyRejectsForcedToolChoice(model string) bool {
 	switch normalizeThinkingModelFamily(model) {
-	case "claude-fable-5-1", "claude-mythos-5-1":
+	case "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5":
 		return true
 	}
 	return false
@@ -987,7 +990,7 @@ func familyRejectsSamplingParams(model string) bool {
 	}
 	switch family {
 	case "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-sonnet-5",
+		"claude-opus-5-5", "claude-sonnet-5",
 		"claude-fable-5", "claude-fable-5-1",
 		"claude-mythos-5", "claude-mythos-5-1":
 		return true
@@ -1023,6 +1026,7 @@ func assistantHasTextContent(msg gjson.Result) bool {
 //	|-----------------------|-----------------------------|-------------------------|
 //	| Fable 5.1 / 5        | adaptive, disabled*         | enabled                 |
 //	| Mythos 5.1 / 5       | adaptive, disabled*         | enabled                 |
+//	| Opus 5.5             | adaptive                    | enabled, disabled       |
 //	| Opus 5               | adaptive, disabled          | enabled                 |
 //	| Opus 4.8 / 4.7       | adaptive                    | enabled                 |
 //	| Sonnet 5             | adaptive                    | enabled                 |
@@ -1052,6 +1056,10 @@ var thinkingTypeRules = map[string][]string{
 	// 自适应为主 (adaptive + disabled; 仅 enabled 被 400 拒绝)。
 	// Opus 5 官方明文接受 disabled（effort ≤ high 时）。
 	"claude-opus-5": {"adaptive", "disabled"},
+
+	// Opus 5.5: 仅 adaptive（enabled/disabled 均 400；官方明言 Opus 5.5
+	// reject disabled，2026-09-25 文档快照）。
+	"claude-opus-5-5": {"adaptive"},
 
 	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
 	"claude-opus-4-8": {"adaptive", "disabled"},
