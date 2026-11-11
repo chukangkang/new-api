@@ -74,7 +74,13 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
-	requestURL := fmt.Sprintf("%s/v1/messages", info.ChannelBaseUrl)
+	// Token Counting API 转发到上游 /v1/messages/count_tokens；
+	// 其余 /v1/messages 请求转发到 /v1/messages。
+	subPath := ""
+	if info != nil && strings.HasSuffix(info.RequestURLPath, "/count_tokens") {
+		subPath = "/count_tokens"
+	}
+	requestURL := fmt.Sprintf("%s/v1/messages%s", info.ChannelBaseUrl, subPath)
 	if !shouldAppendClaudeBetaQuery(info) {
 		return requestURL, nil
 	}

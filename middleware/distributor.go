@@ -39,10 +39,18 @@ func Distribute() func(c *gin.Context) {
 				service.RecordRequestPolicyTermination(c, types.NewErrorWithStatusCode(errors.New("request rejected"), types.ErrorCodeInvalidRequest, c.Writer.Status(), types.ErrOptionWithSkipRetry()))
 			}
 		}()
+		// Channel path matching normalizes /v1/messages/count_tokens to
+		// /v1/messages so channels configured for the Claude Messages endpoint
+		// satisfy the count_tokens request. Upstream forwarding keeps the full
+		// path (handled by the Claude adaptor).
+		channelMatchPath := c.Request.URL.Path
+		if strings.HasSuffix(channelMatchPath, "/count_tokens") {
+			channelMatchPath = strings.TrimSuffix(channelMatchPath, "/count_tokens")
+		}
 		constraints := service.GetChannelConstraints(c)
 		constraints.AddFilter(taskdto.ChannelFilter{
 			Kind:        taskdto.FilterRequestPath,
-			RequestPath: c.Request.URL.Path,
+			RequestPath: channelMatchPath,
 		})
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
@@ -112,11 +120,23 @@ func Distribute() func(c *gin.Context) {
 					Ctx:         c,
 					ModelName:   modelRequest.Model,
 					TokenGroup:  usingGroup,
-					RequestPath: c.Request.URL.Path,
+					RequestPath: channelMatchPath,
 					Retry:       common.GetPointer(0),
 				})
 			}
 			if selectErr != nil {
+				// Anthropic alignment: on /v1/messages paths, any channel-selection
+				// failure (lookup error or no available channel, including the
+				// forged-snapshot case where ability rows exist but no channel is
+				// usable) returns the official 404 not_found_error shape
+				// (platform.claude.com/docs/en/api/errors "Error shapes",
+				// checked 2026-09-18) instead of the usual 503:
+				//   {"type":"error","error":{"type":"not_found_error",
+				//    "message":"The requested resource could not be found."}}
+				if isAnthropicMessagesPath(c.Request.URL.Path) {
+					abortWithAnthropicNotFoundMessage(c, "The requested resource could not be found.")
+					return
+				}
 				if selectErr.FilterKind == taskdto.FilterTaskPluginIdentity {
 					logTaskPluginChannelDecision(c, selectErr.Channel, modelRequest.Model, "channel_rejected", "identity_mismatch")
 				}
@@ -137,6 +157,14 @@ func Distribute() func(c *gin.Context) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
+}
+
+// isAnthropicMessagesPath reports whether the request lands on the Anthropic
+// /v1/messages entry (including /v1/messages/count_tokens). Only these paths
+// use the official not_found_error shape for unavailable-model errors; other
+// entries keep the existing OpenAI-style response.
+func isAnthropicMessagesPath(path string) bool {
+	return path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/")
 }
 
 // noAvailableChannelMessage explains a 503 for a task-plugin-claimed model.
