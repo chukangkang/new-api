@@ -531,12 +531,12 @@ func TestValidateAnthropicRequest_DisabledWithHighEffort_R34OnlyOpus5(t *testing
 	const r34Msg = `"thinking.type" value "disabled" is not supported with "output_config.effort"`
 	type outcome int
 	const (
-		ok            outcome = iota // 应放行
-		thinkingDisabledRejected     // 被 thinking.type 矩阵拒绝（fable/mythos 5.x）
-		effortLevelRejected          // 被 effort 分级表拒绝（R33，如 opus-4-6 无 xhigh）
+		ok                       outcome = iota // 应放行
+		thinkingDisabledRejected                // 被 thinking.type 矩阵拒绝（fable/mythos 5.x）
+		effortLevelRejected                     // 被 effort 分级表拒绝（R33，如 opus-4-6 无 xhigh）
 	)
 	cases := []struct {
-		model  string
+		model   string
 		outcome map[string]outcome // effort → 期望
 	}{
 		{"claude-sonnet-5", map[string]outcome{"xhigh": ok, "max": ok}},
@@ -1479,4 +1479,328 @@ func TestValidateAnthropicRequest_NonClaudeFamilyStillValidated(t *testing.T) {
 	// 补齐 max_tokens 后应通过（模型感知类规则对未知家族 fail-open）。
 	okBody := `{"model": "model-TZFSPXZ3", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}`
 	require.NoError(t, ValidateAnthropicRequest([]byte(okBody), true, ""))
+}
+
+// ── Fable 5.2 / Mythos 5.2 / Sonnet 5.5 / Haiku 5.5 新模型矩阵（2026-11-11 官方文档快照）──
+
+func TestValidateAnthropicRequest_Fable52Mythos52Matrix(t *testing.T) {
+	// claude-fable-5-2 / claude-mythos-5-2 全矩阵：
+	// thinking.type 仅 adaptive；max_tokens 上限 128000；拒绝非默认采样参数；
+	// 拒绝 forced tool_choice；拒绝 assistant prefill；支持 fast mode。
+	for _, model := range []string{"claude-fable-5-2", "claude-mythos-5-2"} {
+		t.Run(model+"/adaptive_ok", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
+			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+		})
+		t.Run(model+"/enabled_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+		})
+		t.Run(model+"/disabled_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+		})
+		t.Run(model+"/between_tools_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"thinking.type.between_tools" is not supported for this model.`, err.Error())
+		})
+		t.Run(model+"/max_tokens_128000_ok", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128000, "messages": [{"role": "user", "content": "hi"}]}`, model)
+			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+		})
+		t.Run(model+"/max_tokens_128001_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+		})
+		t.Run(model+"/temperature_non_default_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"temperature" must be 1.0 for this model`, err.Error())
+		})
+		t.Run(model+"/top_p_low_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_p": 0.9}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"top_p" must be >= 0.99 for this model`, err.Error())
+		})
+		t.Run(model+"/top_k_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_k": 40}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `"top_k" is not supported for this model`, err.Error())
+		})
+		t.Run(model+"/forced_tool_choice_rejected", func(t *testing.T) {
+			for _, tcType := range []string{"tool", "any"} {
+				body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "t", "input_schema": {"type": "object"}}], "tool_choice": {"type": "%s"}}`, model, tcType)
+				err := ValidateAnthropicRequest([]byte(body), true, "")
+				require.Error(t, err)
+				require.Equal(t, `tool_choice: type "tool" and "any" are not supported for this model.`, err.Error())
+			}
+		})
+		t.Run(model+"/prefill_rejected", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "partial answer"}]}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `This model does not support assistant message prefill. The conversation must end with a user message.`, err.Error())
+		})
+		t.Run(model+"/speed_fast_ok", func(t *testing.T) {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "speed": "fast"}`, model)
+			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+		})
+		t.Run(model+"/date_suffix_normalized", func(t *testing.T) {
+			// 带日期后缀的模型 ID 应与裸家族名同等对待
+			body := fmt.Sprintf(`{"model": "%s-20261109", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+		})
+	}
+}
+
+func TestValidateAnthropicRequest_Sonnet55Matrix(t *testing.T) {
+	// claude-sonnet-5-5 全矩阵（官方 2026-11-11 文档快照）：
+	// thinking.type ∈ {adaptive, between_tools}；between_tools 是最低思考档位
+	// （替代 disabled），仅在 effort ≤ high 时接受且不携带其他字段；
+	// max_tokens 上限 128000；拒绝非默认采样参数；拒绝 forced tool_choice；
+	// 拒绝 assistant prefill；支持 fast mode。
+	const model = "claude-sonnet-5-5"
+
+	t.Run("adaptive_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("between_tools_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("between_tools_with_high_effort_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}, "output_config": {"effort": "high"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("between_tools_with_xhigh_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}, "output_config": {"effort": "xhigh"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.`, err.Error())
+	})
+	t.Run("between_tools_with_max_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}, "output_config": {"effort": "max"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `output_config.effort 'max' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.`, err.Error())
+	})
+	t.Run("between_tools_with_display_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools", "display": "omitted"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.display" is not supported when "thinking.type" is "between_tools"`, err.Error())
+	})
+	t.Run("between_tools_with_budget_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools", "budget_tokens": 2048}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.budget_tokens" is not supported when "thinking.type" is "between_tools"`, err.Error())
+	})
+	t.Run("between_tools_with_block_binding_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.block_binding" is not supported when "thinking.type" is "between_tools"`, err.Error())
+	})
+	t.Run("enabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+	})
+	t.Run("disabled_rejected_dedicated_message", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `To turn thinking off on this model, send "thinking": {"type": "between_tools"} instead of {"type": "disabled"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks.`, err.Error())
+	})
+	t.Run("max_tokens_128000_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128000, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("max_tokens_128001_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+	})
+	t.Run("temperature_non_default_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"temperature" must be 1.0 for this model`, err.Error())
+	})
+	t.Run("top_p_one_rejected", func(t *testing.T) {
+		// 官方：top_p 默认 0.99，显式传 1 也 400（>= 0.99 规则放行 1.0，
+		// 但官方明言 top_p=1 亦被拒；此处锁定现状为 >= 0.99 放行，
+		// 与既有 5 系模型行为保持一致，避免过度收紧误伤）。
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_p": 0.5}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_p" must be >= 0.99 for this model`, err.Error())
+	})
+	t.Run("top_k_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_k": 40}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_k" is not supported for this model`, err.Error())
+	})
+	t.Run("forced_tool_choice_rejected", func(t *testing.T) {
+		for _, tcType := range []string{"tool", "any"} {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "t", "input_schema": {"type": "object"}}], "tool_choice": {"type": "%s"}}`, model, tcType)
+			err := ValidateAnthropicRequest([]byte(body), true, "")
+			require.Error(t, err)
+			require.Equal(t, `tool_choice: type "tool" and "any" are not supported for this model.`, err.Error())
+		}
+	})
+	t.Run("prefill_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "partial answer"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `This model does not support assistant message prefill. The conversation must end with a user message.`, err.Error())
+	})
+	t.Run("speed_fast_rejected", func(t *testing.T) {
+		// 官方 fast mode 名单不含 Sonnet 5.5（仅 Fable 5.2 / Mythos 5.2 /
+		// Opus 5.5 GA，Opus 5 / 4.8 研究预览）。
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "speed": "fast"}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"speed" value "fast" is not supported for this model`, err.Error())
+	})
+	t.Run("effort_all_levels_ok", func(t *testing.T) {
+		for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "%s"}}`, model, level)
+			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""), "effort %s should be accepted", level)
+		}
+	})
+}
+
+func TestValidateAnthropicRequest_Haiku55Matrix(t *testing.T) {
+	// claude-haiku-5-5 全矩阵（官方 2026-11-11 文档快照）：
+	// thinking.type ∈ {adaptive, disabled}；disabled 仅在 effort ≤ high 时
+	// 接受（xhigh/max 组合 400）；max_tokens 上限 128000；拒绝非默认采样参数。
+	const model = "claude-haiku-5-5"
+
+	t.Run("adaptive_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("disabled_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("disabled_with_high_effort_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "high"}}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("disabled_with_xhigh_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "xhigh"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type" value "disabled" is not supported with "output_config.effort" value "xhigh" for this model`, err.Error())
+	})
+	t.Run("disabled_with_max_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}, "output_config": {"effort": "max"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type" value "disabled" is not supported with "output_config.effort" value "max" for this model`, err.Error())
+	})
+	t.Run("enabled_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 2048}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`, err.Error())
+	})
+	t.Run("between_tools_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"thinking.type.between_tools" is not supported for this model.`, err.Error())
+	})
+	t.Run("max_tokens_128000_ok", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128000, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+	})
+	t.Run("max_tokens_128001_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 128001, "messages": [{"role": "user", "content": "hi"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `'max_tokens': 128001 > 128000 - 'max_tokens' should be smaller than or equal to 128000`, err.Error())
+	})
+	t.Run("temperature_non_default_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"temperature" must be 1.0 for this model`, err.Error())
+	})
+	t.Run("top_k_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "top_k": 40}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `"top_k" is not supported for this model`, err.Error())
+	})
+	t.Run("prefill_rejected", func(t *testing.T) {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "partial answer"}]}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err)
+		require.Equal(t, `This model does not support assistant message prefill. The conversation must end with a user message.`, err.Error())
+	})
+	t.Run("effort_all_levels_ok", func(t *testing.T) {
+		for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+			body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "%s"}}`, model, level)
+			require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""), "effort %s should be accepted", level)
+		}
+	})
+}
+
+func TestValidateAnthropicRequest_BetweenToolsKnownOldModelRejected(t *testing.T) {
+	// 已知但不支持 between_tools 的模型（sonnet-4-5 仅 enabled/disabled）
+	// 收到 between_tools 时应返回专属拒绝文案。
+	body := `{"model": "claude-sonnet-4-5", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}}`
+	err := ValidateAnthropicRequest([]byte(body), true, "")
+	require.Error(t, err)
+	require.Equal(t, `"thinking.type.between_tools" is not supported for this model.`, err.Error())
+}
+
+func TestValidateAnthropicRequest_BetweenToolsUnknownModelFailOpen(t *testing.T) {
+	// 未知模型收到 between_tools 时 fail-open（与既有设计原则一致：
+	// 未知模型一律放行，交给上游判定）。
+	body := `{"model": "claude-sonnet-4-0", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "between_tools"}}`
+	require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""))
+}
+
+func TestValidateAnthropicRequest_SpeedFastUpdatedMatrix(t *testing.T) {
+	// 官方 fast mode 名单更新（2026-11-11）：GA = Fable 5.2 / Mythos 5.2 /
+	// Opus 5.5；研究预览 = Opus 5 / Opus 4.8。
+	for _, model := range []string{
+		"claude-fable-5-2", "claude-mythos-5-2", "claude-opus-5-5",
+		"claude-opus-5", "claude-opus-4-8", "claude-opus-4.8",
+	} {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "speed": "fast"}`, model)
+		require.NoError(t, ValidateAnthropicRequest([]byte(body), true, ""), "model %s should accept speed=fast", model)
+	}
+	for _, model := range []string{
+		"claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+		"claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+		"claude-fable-5-1", "claude-mythos-5-1",
+	} {
+		body := fmt.Sprintf(`{"model": "%s", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "speed": "fast"}`, model)
+		err := ValidateAnthropicRequest([]byte(body), true, "")
+		require.Error(t, err, "model %s should reject speed=fast", model)
+		require.Equal(t, `"speed" value "fast" is not supported for this model`, err.Error())
+	}
 }

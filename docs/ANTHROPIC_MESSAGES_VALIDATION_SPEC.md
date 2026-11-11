@@ -78,6 +78,7 @@
 | （2026-09-26） | 09-26 | **R34 收窄到仅 claude-opus-5**：disabled + effort∈{xhigh,max} 的 400 限制此前误扩到整个 5 系（opus-5/sonnet-5/fable-5*/mythos-5*）。官方《思考功能故障排查》模型表脚注②只挂在 Opus 5 行，且测试台实测 sonnet-5 的 disabled+xhigh 返回 200（用例 thinking.disabled_xhigh_accepted）。现由 `familyRejectsDisabledWithHighEffort` 门控，仅 opus-5 拒绝，其余模型 fail-open；新增 8 模型 × 2 effort 回归测试 |
 | （2026-09-26） | 09-26 | **claude-opus-5-5 补入全部校验矩阵**（依据官方 2026-09-25 文档快照）：thinking.type 仅 adaptive（enabled/disabled 均 400，官方明言 Opus 5.5 reject disabled）；max_tokens 上限 128000；拒绝非默认采样参数；拒绝 forced tool_choice（与 fable-5-1/mythos-5-1 并列）；拒绝 assistant prefill。handler 层 `ValidateAnthropicRequest` 五张矩阵补齐；新增 `TestValidateAnthropicRequest_Opus55Matrix` 10 子用例 |
 | （2026-09-26） | 09-26 | **image 块校验**（§2.9）：source 三类型结构 + media_type 四值枚举（官方逐字文案）+ base64 ≤10MB + 图片数 ≤600 + 像素 ≤8000×8000（>20 张收紧至 2000px，含 tool_result 内嵌计数）。新文件 `relay/helper/anthropic_image_validation.go`（含 PNG/JPEG/GIF/WebP 头部解析器）；新增 9 组回归测试 |
+| （2026-11-11） | 11-11 | **claude-fable-5-2 / claude-mythos-5-2 / claude-sonnet-5-5 / claude-haiku-5-5 补入全部校验矩阵**（依据官方 2026-11-11 文档快照）：① 新增 thinking.type 枚举 `between_tools`（仅 Sonnet 5.5 接受，替代 disabled；effort ≤ high 才可用；不携带 display/budget_tokens/block_binding）；② fable-5-2/mythos-5-2 仅 adaptive（enabled/disabled/between_tools 均 400）；③ sonnet-5-5 允许 adaptive+between_tools（enabled/disabled 均 400，disabled 有专属引导文案）；④ haiku-5-5 允许 adaptive+disabled（disabled 仅限 effort ≤ high，xhigh/max 组合 400，R34 扩至此模型）；⑤ 四模型 max_tokens 上限 128000、拒绝非默认采样参数、拒绝 assistant prefill；⑥ fable-5-2/mythos-5-2/sonnet-5-5 拒绝 forced tool_choice；⑦ fast mode 名单更新为 fable-5-2/mythos-5-2/opus-5-5（GA）+ opus-5/opus-4-8（研究预览，4.8 于 2026-11-30 退役），sonnet-5-5/haiku-5-5 不支持。新增 `TestValidateAnthropicRequest_Fable52Mythos52Matrix`（2 模型 × 13 子用例）、`TestValidateAnthropicRequest_Sonnet55Matrix`（19 子用例）、`TestValidateAnthropicRequest_Haiku55Matrix`（13 子用例）、`TestValidateAnthropicRequest_SpeedFastUpdatedMatrix` |
 
 合计（`git diff v1.0.0-rc.24..HEAD`，截至 `bd0d0e541`）：25 文件，+4206 / -16。（09-26 三项改动尚未计入）
 
@@ -110,7 +111,7 @@
 ### 2.2 采样参数（分家族）
 
 先算 `family = normalizeModelFamily(model)`（见 §3）。
-`rejectsSampling = family ∈ {opus-4-7, opus-4-8, opus-5, opus-5-5, sonnet-5, fable-5, fable-5-1, mythos-5, mythos-5-1, mythos-preview}`
+`rejectsSampling = family ∈ {opus-4-7, opus-4-8, opus-5, opus-5-5, sonnet-5, sonnet-5-5, haiku-5-5, fable-5, fable-5-1, fable-5-2, mythos-5, mythos-5-1, mythos-5-2, mythos-preview}`
 
 | # | 规则 | 错误文案 |
 |---|------|----------|
@@ -130,16 +131,21 @@
 
 | 模型家族 | 允许 thinking.type | 400 拒绝 |
 |----------|--------------------|----------|
-| claude-fable-5-1 / fable-5 | adaptive | enabled, disabled |
-| claude-mythos-5-1 / mythos-5 | adaptive | enabled, disabled |
-| claude-opus-5-5 | adaptive | enabled, disabled（官方明言 Opus 5.5 reject disabled，2026-09-25 文档快照） |
-| claude-opus-5 | adaptive, disabled | enabled |
-| claude-opus-4-8 / opus-4-7 | adaptive, disabled | enabled |
-| claude-sonnet-5 | adaptive, disabled | enabled |
-| claude-mythos-preview | adaptive, enabled | disabled |
-| claude-opus-4-5 / haiku-4-5 / sonnet-4-5 | enabled, disabled | adaptive |
-| claude-opus-4-6 / sonnet-4-6 | 不限（enabled 已弃用但仍可用） | 无 |
-| 未知模型 | 三种全收（向后兼容） | 无 |
+| claude-fable-5-2 / fable-5-1 / fable-5 | adaptive | enabled, disabled, between_tools |
+| claude-mythos-5-2 / mythos-5-1 / mythos-5 | adaptive | enabled, disabled, between_tools |
+| claude-opus-5-5 | adaptive | enabled, disabled, between_tools（官方明言 Opus 5.5 reject disabled，2026-09-25 文档快照） |
+| claude-opus-5 | adaptive, disabled† | enabled, between_tools |
+| claude-opus-4-8 / opus-4-7 | adaptive, disabled | enabled, between_tools |
+| claude-sonnet-5-5 | adaptive, between_tools‡ | enabled, disabled（disabled 有专属引导文案，见下表） |
+| claude-sonnet-5 | adaptive, disabled | enabled, between_tools |
+| claude-haiku-5-5 | adaptive, disabled† | enabled, between_tools |
+| claude-mythos-preview | adaptive, enabled | disabled, between_tools |
+| claude-opus-4-5 / haiku-4-5 / sonnet-4-5 | enabled, disabled | adaptive, between_tools |
+| claude-opus-4-6 / sonnet-4-6 | 不限（enabled 已弃用但仍可用） | between_tools |
+| 未知模型 | 四种全收（向后兼容） | 无 |
+
+† disabled 仅在 effort ≤ high 时接受，xhigh/max 组合 400（R34）。  
+‡ between_tools 仅在 effort ≤ high 时接受（R37），且不携带任何其他字段（R38）。
 
 \* 官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测返回 200，参考实现曾按实测放宽；2026-09-18 起按官方文档收紧为 400（见 platform.claude.com/docs/en/api/errors "Thinking cannot be disabled"）。
 
@@ -150,9 +156,18 @@
 | `enabled`（4.7+ 模型） | `"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.` |
 | `adaptive`（4.5 系） | `adaptive thinking is not supported on this model` |
 | `disabled`（mythos-preview） | `"thinking.type.disabled" is not supported for this model. Thinking defaults to adaptive mode when not specified; use "thinking.type.enabled" with "budget_tokens" for extended thinking.` |
-| `disabled`（fable/mythos 5.x，若选择按官方收紧） | `"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.` |
-| 其他任意值 | `"thinking.type" must be one of: "enabled", "disabled", "adaptive"` |
+| `disabled`（sonnet-5-5 专属，2026-11-11） | `To turn thinking off on this model, send "thinking": {"type": "between_tools"} instead of {"type": "disabled"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks.` |
+| `disabled`（fable/mythos 5.x 及其他 adaptive-only 模型） | `"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.` |
+| `between_tools`（除 sonnet-5-5 外所有已知模型，2026-11-11） | `"thinking.type.between_tools" is not supported for this model.` |
+| 其他任意值 | `"thinking.type" must be one of: "enabled", "disabled", "adaptive", "between_tools"` |
 | `thinking` 存在但缺 `type` | `"thinking.type" is a required property` |
+
+#### thinking.type=between_tools 专属（2026-11-11 新增，仅 claude-sonnet-5-5）
+
+| # | 规则 | 文案 |
+|---|------|------|
+| R37 | type=between_tools 且 effort ∈ {xhigh, max}（官方原文点名请求所发的级别） | `output_config.effort '<effort>' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.` |
+| R38 | type=between_tools 且携带 `display` / `budget_tokens` / `block_binding` 任一字段（官方：takes no other field） | `"thinking.<field>" is not supported when "thinking.type" is "between_tools"` |
 
 #### thinking.display
 
@@ -176,21 +191,23 @@
 
 | # | 规则 | 文案 |
 |---|------|------|
-| R29 | 4.6+ 家族（opus-4-6/sonnet-4-6/opus-4-7/opus-4-8/opus-5/opus-5-5/sonnet-5/fable-5/fable-5-1/mythos-5/mythos-5-1/mythos-preview）且**最后一条消息是带文本内容的 assistant**（prefill） | `This model does not support assistant message prefill. The conversation must end with a user message.` |
-| R30 | fable-5-1 / mythos-5-1 / **opus-5-5** 且 `tool_choice.type` ∈ {tool, any} | `tool_choice: type "tool" and "any" are not supported for this model.` |
+| R29 | 4.6+ 家族（opus-4-6/sonnet-4-6/opus-4-7/opus-4-8/opus-5/opus-5-5/sonnet-5/sonnet-5-5/haiku-5-5/fable-5/fable-5-1/fable-5-2/mythos-5/mythos-5-1/mythos-5-2/mythos-preview）且**最后一条消息是带文本内容的 assistant**（prefill） | `This model does not support assistant message prefill. The conversation must end with a user message.` |
+| R30 | fable-5-2 / fable-5-1 / mythos-5-2 / mythos-5-1 / **opus-5-5** / **sonnet-5-5** 且 `tool_choice.type` ∈ {tool, any} | `tool_choice: type "tool" and "any" are not supported for this model.` |
 | R31 | `output_config.effort` 非字符串 | `"output_config.effort" must be a string` |
 | R32 | effort ∉ {low, medium, high, xhigh, max} | `"output_config.effort" must be one of: "low", "medium", "high", "xhigh", "max"` |
 | R33 | effort 不在该模型支持级别内（分级表见下表） | `"output_config.effort" value "<v>" is not supported for this model` |
-| R34 | thinking.type=disabled 且 effort ∈ {xhigh, max}，**仅限 claude-opus-5**（2026-09-26 收窄：官方《思考功能故障排查》模型表脚注②只挂在 Opus 5 行；此前误扩到整个 5 系，但测试台实测 sonnet-5 的 disabled+xhigh 返回 200，用例 thinking.disabled_xhigh_accepted）；fable-5*/mythos-5* 的 disabled 已被 thinking.type 矩阵先行 400；Opus 4.8/4.7/4.6 等更早模型 disabled+xhigh 仍 200（2026-09-18 真伪验证实测） | `"thinking.type" value "disabled" is not supported with "output_config.effort" value "<effort>" for this model` |
+| R34 | thinking.type=disabled 且 effort ∈ {xhigh, max}，**仅限 claude-opus-5 与 claude-haiku-5-5**（2026-09-26 收窄到 opus-5；2026-11-11 官方《思考功能故障排查》脚注②同时挂在 Haiku 5.5 行，扩回此一家；sonnet-5 的 disabled+xhigh 实测 200 不变）；fable-5*/mythos-5* 的 disabled 已被 thinking.type 矩阵先行 400；Opus 4.8/4.7/4.6 等更早模型 disabled+xhigh 仍 200（2026-09-18 真伪验证实测） | `"thinking.type" value "disabled" is not supported with "output_config.effort" value "<effort>" for this model` |
 
 **R33 的 effort 分级表**（源自 `backend/internal/pkg/claude/effort_catalog.go` 的 `EffortLevelsForModel`，移植时整表照抄）：
 
 | 模型家族 | 支持的 effort 级别 |
 |----------|--------------------|
 | claude-mythos-preview | low, medium, high, max |
-| claude-mythos-5（含 mythos-5-1） | low, medium, high, xhigh, max |
-| claude-fable-5（含 fable-5-1） | low, medium, high, xhigh, max |
+| claude-mythos-5（含 mythos-5-1 / mythos-5-2） | low, medium, high, xhigh, max |
+| claude-fable-5（含 fable-5-1 / fable-5-2） | low, medium, high, xhigh, max |
 | claude-sonnet-4-6 | low, medium, high, max |
+| claude-sonnet-5-5 | low, medium, high, xhigh, max |
+| claude-haiku-5-5 | low, medium, high, xhigh, max |
 | claude-sonnet-5 | low, medium, high, xhigh, max |
 | claude-opus-4-8 | low, medium, high, xhigh, max |
 | claude-opus-4-7 | low, medium, high, xhigh, max |
@@ -199,18 +216,20 @@
 | claude-opus-5 | low, medium, high, xhigh, max |
 | 未知模型 | 全部放行（返回 nil = 不限制） |
 
-匹配规则：模型 ID 先做归一化（小写、去 `models/` 前缀、去 `anthropic.` 前缀、去 `-thinking` 后缀、去 8 位日期后缀），然后要求**精确等于家族名或以 `<家族名>-` 为前缀**（所以 `claude-fable-5-1` 命中 `claude-fable-5` 条目）。注意 `claude-haiku-4-5` 不在表中 → 视为未知 → 放行。
-| R35 | `speed=fast` 且模型不支持 fast（仅 opus-5 / opus-4.8 支持） | `"speed" value "fast" is not supported for this model` |
+匹配规则：模型 ID 先做归一化（小写、去 `models/` 前缀、去 `anthropic.` 前缀、去 `-thinking` 后缀、去 8 位日期后缀），然后要求**精确等于家族名或以 `<家族名>-` 为前缀**（所以 `claude-fable-5-1` 命中 `claude-fable-5` 条目）。子版本条目必须排在父家族之前（前缀匹配先到先得，如 `claude-sonnet-5-5` 必须在 `claude-sonnet-5` 之前）。注意 `claude-haiku-4-5` 不在表中 → 视为未知 → 放行。
+| R35 | `speed=fast` 且模型不支持 fast（2026-11-11 官方名单：fable-5-2 / mythos-5-2 / opus-5-5 GA；opus-5 / opus-4.8 研究预览，4.8 于 2026-11-30 退役；兼容点号写法 `claude-opus-4.8`） | `"speed" value "fast" is not supported for this model` |
 | R36 | max_tokens 超模型输出上限（分级表见下表） | `'max_tokens': <n> > <cap> - 'max_tokens' should be smaller than or equal to <cap>` |
 
 **R36 的 max_tokens 上限表**（源自 `gateway_anthropic_validation.go` 的 `modelMaxOutputTokens`，移植时整表照抄）：
 
 | 模型家族 | max_tokens 上限 |
 |----------|----------------|
-| claude-fable-5-1 / fable-5 | 128000 |
-| claude-mythos-5-1 / mythos-5 | 128000（官方明言 Mythos 5 与 Fable 5 共享规格） |
+| claude-fable-5-2 / fable-5-1 / fable-5 | 128000 |
+| claude-mythos-5-2 / mythos-5-1 / mythos-5 | 128000（官方明言 Mythos 5 与 Fable 5 共享规格） |
 | claude-opus-5 | 128000 |
 | claude-opus-5-5 | 128000（2026-09-25 文档快照） |
+| claude-sonnet-5-5 | 128000（2026-11-11 文档快照） |
+| claude-haiku-5-5 | 128000（2026-11-11 文档快照） |
 | claude-sonnet-5 | 128000 |
 | claude-opus-4-8 | 128000 |
 | claude-opus-4-7 | 128000 |

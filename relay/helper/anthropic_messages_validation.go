@@ -311,6 +311,17 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 				}
 			}
 		}
+
+		// ── thinking.type=between_tools: 仅 Sonnet 5.5，且不携带任何其他字段 ──
+		// 官方（2026-11-11）：between_tools 是 Sonnet 5.5 的最低思考档位，
+		// 替代 disabled；display / budget_tokens / block_binding 与之同发即 400。
+		if tt.Str == "between_tools" {
+			for _, field := range []string{"display", "budget_tokens", "block_binding"} {
+				if th.Get(field).Exists() {
+					return fmt.Errorf(`"thinking.%s" is not supported when "thinking.type" is "between_tools"`, field)
+				}
+			}
+		}
 	}
 
 	// ── prefill: 4.6+ / Mythos Preview 不支持 assistant 预填充 ──
@@ -359,14 +370,14 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		}
 	}
 
-	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 不可关思考 ──
-	// 官方：Claude Opus 5 在 xhigh/max effort 下无法关闭 thinking，
-	// 两者组合返回 400。低档 effort（≤high）允许 disabled。
-	// 注意：仅 claude-opus-5 受此约束（官方《思考功能故障排查》模型表脚注②
-	// 只挂在 Opus 5 行）；sonnet-5 的 disabled+xhigh 实测 200（2026-09-26
-	// 测试台用例 thinking.disabled_xhigh_accepted），fable-5*/mythos-5*
-	// 本就拒绝 disabled（thinking.type 矩阵先行拦截）；Opus 4.8 / 4.7 / 4.6
-	// 等更早模型 disabled + xhigh 仍可 200（真伪验证实测）。
+	// ── thinking.type=disabled + effort=xhigh/max 组合：Opus 5 / Haiku 5.5
+	// 不可关思考 ──
+	// 官方：Claude Opus 5 与 Claude Haiku 5.5 在 xhigh/max effort 下无法关闭
+	// thinking，两者组合返回 400。低档 effort（≤high）允许 disabled。
+	// 注意：sonnet-5 的 disabled+xhigh 实测 200（2026-09-26 测试台用例
+	// thinking.disabled_xhigh_accepted），fable-5*/mythos-5* 本就拒绝
+	// disabled（thinking.type 矩阵先行拦截）；Opus 4.8 / 4.7 / 4.6 等更早
+	// 模型 disabled + xhigh 仍可 200（真伪验证实测）。
 	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "disabled" &&
 		familyRejectsDisabledWithHighEffort(model.Str) {
 		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
@@ -376,7 +387,19 @@ func ValidateAnthropicRequest(body []byte, requireMaxTokens bool, betaHeader str
 		}
 	}
 
-	// ── speed: fast mode 仅 Opus 5 / Opus 4.8 支持，其余模型传 speed=fast 应 400 ──
+	// ── thinking.type=between_tools + effort=xhigh/max：Sonnet 5.5 不可用高档 effort ──
+	// 官方（2026-11-11）：between_tools 仅在 effort ≤ high 时接受，xhigh/max
+	// 组合 400，官方原文点名请求所发的级别。
+	if th := gjson.GetBytes(body, "thinking"); th.Exists() && th.Get("type").Str == "between_tools" {
+		if eff := gjson.GetBytes(body, "output_config.effort"); eff.Exists() && eff.Type == gjson.String {
+			if eff.Str == "xhigh" || eff.Str == "max" {
+				return fmt.Errorf("output_config.effort '%s' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking.", eff.Str)
+			}
+		}
+	}
+
+	// ── speed: fast mode 仅 Fable 5.2 / Mythos 5.2 / Opus 5.5（GA）与
+	// Opus 5 / Opus 4.8（研究预览）支持，其余模型传 speed=fast 应 400 ──
 	if sp := gjson.GetBytes(body, "speed"); sp.Exists() && sp.Type == gjson.String && strings.EqualFold(sp.Str, "fast") {
 		if !modelSupportsFastMode(model.Str) {
 			return errors.New(`"speed" value "fast" is not supported for this model`)
@@ -831,6 +854,9 @@ var effortFamilies = []struct {
 	{family: "claude-mythos-5", levels: effortLowMediumHighXHighMax},
 	{family: "claude-fable-5", levels: effortLowMediumHighXHighMax},
 	{family: "claude-sonnet-4-6", levels: effortLowMediumHighMax},
+	// 子版本条目必须排在父家族之前（前缀匹配先到先得）。
+	{family: "claude-sonnet-5-5", levels: effortLowMediumHighXHighMax},
+	{family: "claude-haiku-5-5", levels: effortLowMediumHighXHighMax},
 	{family: "claude-sonnet-5", levels: effortLowMediumHighXHighMax},
 	{family: "claude-opus-4-8", levels: effortLowMediumHighXHighMax},
 	{family: "claude-opus-4-7", levels: effortLowMediumHighXHighMax},
@@ -882,9 +908,9 @@ func normalizeEffortModelID(model string) string {
 }
 
 // modelMaxOutputTokens 返回模型的同步 Messages API 最大输出 token 上限。
-// 依据官方各模型页（2026-09-17 逐一核实）：
-//   - 128K：Fable 5.1 / Fable 5 / Mythos 5 / Mythos 5.1 / Opus 5 / Sonnet 5 /
-//     Opus 4.7 / 4.8 / Opus 4.6 / Sonnet 4.6
+// 依据官方各模型页（2026-09-17 首次核实，2026-11-11 复核 5.2/5.5 新模型）：
+//   - 128K：Fable 5.2 / 5.1 / 5 / Mythos 5.2 / 5.1 / 5 / Opus 5 / 5.5 /
+//     Sonnet 5 / 5.5 / Haiku 5.5 / Opus 4.7 / 4.8 / Opus 4.6 / Sonnet 4.6
 //   - 64K：Haiku 4.5 / Opus 4.5 / Sonnet 4.5
 //
 // Mythos 5 官方明言与 Fable 5 共享规格（128K）；mythos-preview 无公开规格页，
@@ -895,9 +921,10 @@ func normalizeEffortModelID(model string) string {
 // 128000 放行。早期实现误用 128*1024 导致 128001~131072 区间被误放行。
 func modelMaxOutputTokens(model string) (int, bool) {
 	switch normalizeThinkingModelFamily(model) {
-	case "claude-fable-5-1", "claude-fable-5",
-		"claude-mythos-5-1", "claude-mythos-5",
-		"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5",
+	case "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5",
+		"claude-mythos-5-2", "claude-mythos-5-1", "claude-mythos-5",
+		"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5",
+		"claude-haiku-5-5",
 		"claude-opus-4-8", "claude-opus-4-7",
 		"claude-opus-4-6", "claude-sonnet-4-6":
 		return 128000, true
@@ -909,25 +936,31 @@ func modelMaxOutputTokens(model string) (int, bool) {
 
 // familyRejectsDisabledWithHighEffort 判断模型在 thinking.type=disabled
 // 搭配 effort=xhigh/max 时是否应返回 400。
-// 仅 claude-opus-5 受此约束（2026-09-26 收窄：官方《思考功能故障排查》
-// 模型表脚注②只挂在 Opus 5 行；此前误扩到整个 5 系，但测试台实测
-// sonnet-5 的 disabled+xhigh 返回 200）。其余模型 fail-open。
+// claude-opus-5 与 claude-haiku-5-5 受此约束（官方《思考功能故障排查》
+// 模型表脚注②挂在两行上；此前误扩到整个 5 系，但测试台实测 sonnet-5
+// 的 disabled+xhigh 返回 200）。其余模型 fail-open。
 func familyRejectsDisabledWithHighEffort(model string) bool {
-	return normalizeThinkingModelFamily(model) == "claude-opus-5"
+	switch normalizeThinkingModelFamily(model) {
+	case "claude-opus-5", "claude-haiku-5-5":
+		return true
+	}
+	return false
 }
 
 // modelSupportsFastMode 判断模型是否支持 fast mode（speed=fast）。
-// 目前仅 Claude Opus 5 / Opus 4.8 支持；其余模型传 speed=fast 应 400。
+// 官方 fast mode 文档（2026-11-11 快照）：GA 支持者为 Fable 5.2、
+// Mythos 5.2、Opus 5.5；研究预览为 Opus 5 / Opus 4.8（后者 2026-11-30
+// 退役）。其余模型传 speed=fast 应 400。
 func modelSupportsFastMode(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
-	if !strings.Contains(m, "opus") {
-		return false
-	}
-	// "opus-5" 必须先判：不能用裸 "5" 匹配，否则 claude-opus-4-5 会被误判。
-	if strings.Contains(m, "opus-5") || strings.Contains(m, "opus5") {
+	// 兼容点号写法（如 claude-opus-4.8）：统一转为连字符后再匹配。
+	m = strings.ReplaceAll(m, ".", "-")
+	switch normalizeThinkingModelFamily(m) {
+	case "claude-fable-5-2", "claude-mythos-5-2",
+		"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8":
 		return true
 	}
-	return strings.Contains(m, "4.8") || strings.Contains(m, "4-8")
+	return false
 }
 
 // thinkingTypeError 返回与官方 API 完全一致的 thinking.type 拒绝消息。
@@ -945,7 +978,15 @@ func thinkingTypeError(family, requested string) error {
 		if family == "claude-mythos-preview" {
 			return errors.New(`"thinking.type.disabled" is not supported for this model. Thinking defaults to adaptive mode when not specified; use "thinking.type.enabled" with "budget_tokens" for extended thinking.`)
 		}
+		// Sonnet 5.5 的最低思考档位是 between_tools，disabled 在任何
+		// effort 下都被拒绝（官方故障排查页专属文案）。
+		if family == "claude-sonnet-5-5" {
+			return errors.New(`To turn thinking off on this model, send "thinking": {"type": "between_tools"} instead of {"type": "disabled"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks.`)
+		}
 		return errors.New(`"thinking.type.disabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort" to control thinking behavior.`)
+	case "between_tools":
+		// 仅 Claude Sonnet 5.5 接受（官方故障排查页原文）。
+		return errors.New(`"thinking.type.between_tools" is not supported for this model.`)
 	default:
 		return fmt.Errorf("\"thinking.type\" must be one of: %s", joinQuoted(allThinkingTypes))
 	}
@@ -962,19 +1003,23 @@ func familySupportsPrefillReject(model string) bool {
 	switch family {
 	case "claude-opus-4-6", "claude-sonnet-4-6",
 		"claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-opus-5-5", "claude-sonnet-5",
-		"claude-fable-5", "claude-fable-5-1",
-		"claude-mythos-5", "claude-mythos-5-1":
+		"claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5",
+		"claude-haiku-5-5",
+		"claude-fable-5", "claude-fable-5-2", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-2", "claude-mythos-5-1":
 		return true
 	}
 	return false
 }
 
 // familyRejectsForcedToolChoice 判断模型是否拒绝 tool_choice 的 "tool"/"any"：
-// Claude Fable 5.1、Claude Mythos 5.1 与 Claude Opus 5.5。
+// Claude Fable 5.2 / 5.1、Claude Mythos 5.2 / 5.1、Claude Opus 5.5 与
+// Claude Sonnet 5.5（官方：这些模型在所有请求上都拒绝强制工具调用）。
 func familyRejectsForcedToolChoice(model string) bool {
 	switch normalizeThinkingModelFamily(model) {
-	case "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5":
+	case "claude-fable-5-2", "claude-fable-5-1",
+		"claude-mythos-5-2", "claude-mythos-5-1",
+		"claude-opus-5-5", "claude-sonnet-5-5":
 		return true
 	}
 	return false
@@ -990,9 +1035,10 @@ func familyRejectsSamplingParams(model string) bool {
 	}
 	switch family {
 	case "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-		"claude-opus-5-5", "claude-sonnet-5",
-		"claude-fable-5", "claude-fable-5-1",
-		"claude-mythos-5", "claude-mythos-5-1":
+		"claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-5-5",
+		"claude-haiku-5-5",
+		"claude-fable-5", "claude-fable-5-2", "claude-fable-5-1",
+		"claude-mythos-5", "claude-mythos-5-2", "claude-mythos-5-1":
 		return true
 	}
 	return false
@@ -1024,21 +1070,25 @@ func assistantHasTextContent(msg gjson.Result) bool {
 //
 //	| Model Family          | Allowed thinking.type       | Rejected with 400       |
 //	|-----------------------|-----------------------------|-------------------------|
-//	| Fable 5.1 / 5        | adaptive, disabled*         | enabled                 |
-//	| Mythos 5.1 / 5       | adaptive, disabled*         | enabled                 |
-//	| Opus 5.5             | adaptive                    | enabled, disabled       |
-//	| Opus 5               | adaptive, disabled          | enabled                 |
-//	| Opus 4.8 / 4.7       | adaptive                    | enabled                 |
-//	| Sonnet 5             | adaptive                    | enabled                 |
-//	| Mythos Preview       | adaptive, enabled           | disabled                |
-//	| Opus 4.6 / Sonnet 4.6| adaptive, enabled (deprec.) | (none)                |
-//	| Opus 4.5             | enabled, disabled           | adaptive                |
-//	| Haiku 4.5            | enabled, disabled           | adaptive                |
-//	| Sonnet 4.5           | enabled, disabled           | adaptive                |
+//	| Fable 5.2 / 5.1 / 5  | adaptive, disabled*         | enabled, between_tools  |
+//	| Mythos 5.2 / 5.1 / 5 | adaptive, disabled*         | enabled, between_tools  |
+//	| Opus 5.5             | adaptive                    | enabled, disabled, between_tools |
+//	| Opus 5               | adaptive, disabled†         | enabled, between_tools  |
+//	| Opus 4.8 / 4.7       | adaptive, disabled          | enabled, between_tools  |
+//	| Sonnet 5.5           | adaptive, between_tools‡    | enabled, disabled       |
+//	| Sonnet 5             | adaptive, disabled          | enabled, between_tools  |
+//	| Haiku 5.5            | adaptive, disabled†         | enabled, between_tools  |
+//	| Mythos Preview       | adaptive, enabled           | disabled, between_tools |
+//	| Opus 4.6 / Sonnet 4.6| adaptive, enabled (deprec.) | between_tools           |
+//	| Opus 4.5             | enabled, disabled           | adaptive, between_tools |
+//	| Haiku 4.5            | enabled, disabled           | adaptive, between_tools |
+//	| Sonnet 4.5           | enabled, disabled           | adaptive, between_tools |
 //
 //	* 官方文档称 Fable/Mythos 5.x 拒绝 disabled，但实测返回 200，按实测放宽。
+//	† disabled 仅在 effort ≤ high 时接受，xhigh/max 组合 400。
+//	‡ between_tools 仅在 effort ≤ high 时接受，且不携带任何其他字段。
 //
-// Models not in the table accept all three types (backward compat).
+// Models not in the table accept all four types (backward compat).
 // ─────────────────────────────────────────────────────────────────────────────
 
 // thinkingTypeRules maps normalized model family → allowed thinking.type values.
@@ -1048,6 +1098,8 @@ var thinkingTypeRules = map[string][]string{
 	// 官方文档（platform.claude.com/docs/en/api/errors "Thinking cannot be
 	// disabled"）：Fable/Mythos 5.x 发送 thinking.type=disabled 返回 400。
 	// 早期参考实现按实测放宽（实测 200），2026-09-18 按官方文档收紧。
+	"claude-fable-5-2":  {"adaptive"},
+	"claude-mythos-5-2": {"adaptive"},
 	"claude-fable-5-1":  {"adaptive"},
 	"claude-mythos-5-1": {"adaptive"},
 	"claude-fable-5":    {"adaptive"},
@@ -1060,6 +1112,14 @@ var thinkingTypeRules = map[string][]string{
 	// Opus 5.5: 仅 adaptive（enabled/disabled 均 400；官方明言 Opus 5.5
 	// reject disabled，2026-09-25 文档快照）。
 	"claude-opus-5-5": {"adaptive"},
+
+	// Sonnet 5.5: adaptive + between_tools（enabled/disabled 均 400；
+	// between_tools 是它的最低思考档位，替代 disabled，2026-11-11 官方文档）。
+	"claude-sonnet-5-5": {"adaptive", "between_tools"},
+
+	// Haiku 5.5: adaptive + disabled（enabled 400；disabled 仅限 effort ≤ high，
+	// xhigh/max 组合由下方的 disabled+effort 检查拦截）。
+	"claude-haiku-5-5": {"adaptive", "disabled"},
 
 	// 自适应为主，默认关闭 (adaptive + disabled; 仅 enabled 被 400 拒绝)
 	"claude-opus-4-8": {"adaptive", "disabled"},
@@ -1078,7 +1138,9 @@ var thinkingTypeRules = map[string][]string{
 }
 
 // allThinkingTypes is the fallback for unknown models.
-var allThinkingTypes = []string{"enabled", "disabled", "adaptive"}
+// between_tools 于 2026-11 随 Sonnet 5.5 引入，仅该模型接受（见
+// thinkingTypeRules）；加入全集是为了让拒绝消息列出全部合法枚举。
+var allThinkingTypes = []string{"enabled", "disabled", "adaptive", "between_tools"}
 
 // allowedThinkingTypes returns the allowed thinking.type values for a model.
 func allowedThinkingTypes(model string) []string {
